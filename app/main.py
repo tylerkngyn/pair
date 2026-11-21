@@ -49,6 +49,11 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/metrics")
+async def metrics():
+    return app.state.rooms.metrics.as_dict()
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(socket: WebSocket):
     manager: RoomManager = socket.app.state.rooms

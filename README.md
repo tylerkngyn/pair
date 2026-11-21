@@ -244,3 +244,80 @@ minute worst case — `PAIR_PRESENCE_TTL_SECONDS` and
 `PAIR_REAP_INTERVAL_SECONDS` override the constants of the same name in
 `app/redis_room_manager.py`; production behavior is unchanged unless they
 are explicitly set.
+
+`tests/test_load_balancer_integration.py` closes a related but separate
+gap: the Redis Pub/Sub design was specifically chosen so WebSocket
+connections never need session affinity ("sticky sessions") — any worker
+can deliver any room's events once it has a local peer in that room. That
+claim had never been tested against an actual reverse proxy, only two
+manually-dialed local ports. This test puts two real `uvicorn` processes
+behind a real `nginx:alpine` container doing plain round-robin (no
+`ip_hash`), connects two real WebSocket clients through the one proxy URL,
+and proves they land on different backends yet still chat correctly. Same
+opt-in/skip rules as above. It does **not** test Render's actual production
+load balancer — that's a managed black box you can't instantiate locally —
+see "Scaling beyond one instance in production" below for that distinction.
+
+### Observability
+
+`GET /metrics` returns a small JSON object of per-process counters:
+`rooms_active`, `peers_connected_total`, `reap_sweeps_total`, and
+`peers_reaped_total`. These are deliberately plain counters in a
+`dataclass` (`app/metrics.py`), not Prometheus-format output — nothing in
+this deployment scrapes Prometheus, and a 2-peer ephemeral chat MVP doesn't
+warrant a metrics backend, alerting, or an APM. Each worker reports only
+what it has personally seen; there's no cross-worker aggregation, matching
+the rest of this app's design where only Redis room membership is actually
+shared state. If cluster-wide totals were ever needed, the natural
+follow-up is a small Redis-backed `INCR` per counter — not built now, since
+nothing currently needs it.
+
+### Known gaps that are not closeable in this repo
+
+Two things were considered for distributed-system hardening and
+deliberately left undone, because building fake code to "solve" them would
+be actively misleading:
+
+- **Redis is a single point of failure.** `RedisRoomManager` takes one
+  `redis_url` — there is no Sentinel/cluster-aware client wiring, and
+  `fakeredis` cannot simulate real primary/replica failover, so a test that
+  claimed to prove HA would prove nothing. Real resilience here needs a
+  Sentinel quorum (or a managed Redis product with failover) and
+  Sentinel-aware client code — both outside what this codebase or its
+  current (free-tier) hosting can provide. What *is* in place: the Redis
+  Pub/Sub listener and reap loop now log a warning and retry/reconnect
+  automatically on a dropped Redis connection, rather than silently
+  stalling delivery forever (see `RECONNECT_BACKOFF_SECONDS` in
+  `app/redis_room_manager.py`) — that's an honest improvement to this
+  single Redis's failure visibility, not a fix for it being a SPOF.
+- **No horizontal autoscaling.** `render.yaml` runs `plan: free`,
+  `numInstances: 1`. Render's free tier does not support `numInstances`
+  greater than 1, CPU/memory-based autoscaling, or rolling deploys across
+  multiple instances at any configuration — that functionality exists only
+  on Render's paid "Standard" tier and above. There is nothing to build in
+  this repo to close this gap; it is a hosting-plan upgrade, not a code
+  change. The app's code already supports running N instances correctly
+  (that's what the Redis work above is for), and `GET /health` is already
+  a ready-to-use health-check endpoint the moment a higher tier is in use.
+
+#### Scaling beyond one instance in production
+
+Once (and only if) this project moves to a Render plan that supports it,
+scaling out is a `render.yaml` config change, not a code change:
+
+```yaml
+services:
+  - type: web
+    name: pair-room-chat
+    plan: standard        # numInstances > 1 requires a paid plan
+    numInstances: 2        # or a {min, max} range, per Render's current schema
+    envVars:
+      - key: REDIS_URL
+        value: <your Redis instance URL>
+```
+
+Render fronts all instances with its own managed load balancer
+automatically — there is no user-configurable LB to install or test
+against on Render itself; `tests/test_load_balancer_integration.py` above
+is a stand-in proving the underlying no-sticky-sessions architecture is
+sound, not a claim that it was tested against Render's specific LB.
