@@ -60,7 +60,31 @@ class PingEvent(StrictModel):
     payload: EmptyPayload
 
 
-ClientEvent = Annotated[JoinEvent | ChatEvent | PingEvent, Field(discriminator="type")]
+class TypingInput(StrictModel):
+    typing: bool
+
+
+class TypingEvent(StrictModel):
+    type: Literal["typing"]
+    payload: TypingInput
+
+
+REACTION_EMOJI = ("👍", "❤️", "😂", "😮", "👏")
+
+
+class ReactionInput(StrictModel):
+    emoji: Literal[REACTION_EMOJI]
+
+
+class ReactionEvent(StrictModel):
+    type: Literal["reaction"]
+    payload: ReactionInput
+
+
+ClientEvent = Annotated[
+    JoinEvent | ChatEvent | PingEvent | TypingEvent | ReactionEvent,
+    Field(discriminator="type"),
+]
 client_event_adapter = TypeAdapter(ClientEvent)
 
 
@@ -78,6 +102,16 @@ class ChatPayload(StrictModel):
 
 class SystemPayload(StrictModel):
     text: str
+
+
+class TypingPayload(StrictModel):
+    sender: str
+    typing: bool
+
+
+class ReactionPayload(StrictModel):
+    sender: str
+    emoji: Literal[REACTION_EMOJI]
 
 
 class ErrorPayload(StrictModel):
@@ -105,4 +139,17 @@ class ErrorEvent(StrictModel):
     payload: ErrorPayload
 
 
-ServerEvent = RoomStateEvent | ChatBroadcast | SystemEvent | ErrorEvent
+class TypingBroadcast(StrictModel):
+    type: Literal["typing"] = "typing"
+    payload: TypingPayload
+
+
+class ReactionBroadcast(StrictModel):
+    type: Literal["reaction"] = "reaction"
+    payload: ReactionPayload
+
+
+ServerEvent = (
+    RoomStateEvent | ChatBroadcast | SystemEvent | ErrorEvent
+    | TypingBroadcast | ReactionBroadcast
+)

@@ -9,7 +9,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from pydantic import ValidationError
 
-from app.models import ChatEvent, JoinEvent, client_event_adapter
+from app.models import ChatEvent, JoinEvent, ReactionEvent, TypingEvent, client_event_adapter
 from app.room_manager import RoomManager
 
 INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
@@ -69,6 +69,10 @@ async def websocket_endpoint(socket: WebSocket):
                 await manager.chat(peer, event.payload.text)
                 if peer.room is None:
                     break
+            elif isinstance(event, TypingEvent):
+                await manager.typing(peer, event.payload.typing)
+            elif isinstance(event, ReactionEvent):
+                await manager.react(peer, event.payload.emoji)
             # ping is deliberately one-way; the protocol has no pong event.
     except (WebSocketDisconnect, OSError):
         pass
