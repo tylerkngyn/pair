@@ -172,6 +172,67 @@ def test_reap_is_noop_while_presence_alive(two_workers):
     run_with_workers(worker_a, worker_b, scenario)
 
 
+def test_metrics_track_joins_and_reaps(two_workers):
+    worker_a, worker_b = two_workers
+
+    async def scenario():
+        alice = Peer(socket=FakeSocket())
+        bob = Peer(socket=FakeSocket())
+        await worker_a.join(alice, "ABC123", "Alice")
+        await worker_b.join(bob, "ABC123", "Bob")
+        await settle()
+
+        assert worker_a.metrics.as_dict()["peers_connected_total"] == 1
+        assert worker_a.metrics.rooms_active == 1
+        assert worker_a.metrics.as_dict()["reap_sweeps_total"] == 0
+
+        await worker_a._redis.delete(worker_a._presence_key("ABC123", alice.id))
+        await worker_b._reap_once()
+        await settle()
+
+        # Sweeps/reaps are per-process: the sweeping worker (b) recorded
+        # them, not the worker whose local peer was actually evicted (a).
+        assert worker_b.metrics.as_dict()["reap_sweeps_total"] == 1
+        assert worker_b.metrics.as_dict()["peers_reaped_total"] == 1
+
+    run_with_workers(worker_a, worker_b, scenario)
+
+
+def test_peers_reaped_metric_does_not_double_count_a_concurrent_sweep(two_workers):
+    """Two workers' sweeps can both observe the same stale peer before
+    either has actually removed it. Only whichever one's HDEL really
+    removed it should count toward peers_reaped_total — otherwise the
+    metric overcounts actual reaps, which matters if it's ever aggregated
+    cluster-wide (see README).
+    """
+    worker_a, worker_b = two_workers
+
+    async def scenario():
+        alice = Peer(socket=FakeSocket())
+        await worker_a.join(alice, "ABC123", "Alice")
+        await worker_a._redis.delete(worker_a._presence_key("ABC123", alice.id))
+        await settle()
+
+        # Both workers' sweeps observe the same stale peer "concurrently"
+        # (sequentially here, but neither has removed it yet when the
+        # second one checks presence) — simulate by calling the removal
+        # directly for both without an intervening HDEL from either.
+        first = await worker_a._remove_peer("ABC123", alice.id, "Alice")
+        second = await worker_b._remove_peer("ABC123", alice.id, "Alice")
+
+        assert first is True
+        assert second is False
+        # Mirrors the real call site in _reap_once: only increment on a true removal.
+        if first:
+            worker_a.metrics.record_peer_reaped()
+        if second:
+            worker_b.metrics.record_peer_reaped()
+        assert worker_a.metrics.as_dict()["peers_reaped_total"] == 1
+        assert worker_b.metrics.as_dict()["peers_reaped_total"] == 0
+
+    run_with_workers(worker_a, worker_b, scenario)
+
+
 def test_reap_removes_crashed_peer_and_frees_capacity(two_workers):
     worker_a, worker_b = two_workers
 
@@ -335,3 +396,62 @@ def test_heartbeat_extends_room_ttl(two_workers):
         assert ttl > 5
 
     run_with_workers(worker_a, worker_b, scenario)
+
+
+def test_listener_survives_a_dropped_redis_connection(two_workers):
+    """A Redis connection error must not silently kill the listener task
+    forever — every local peer would stop receiving room events with no
+    signal anywhere. It should log and resubscribe instead.
+    """
+    worker_a, worker_b = two_workers
+
+    async def scenario():
+        import app.redis_room_manager as module
+        from redis.exceptions import ConnectionError as RedisConnectionError
+
+        original_pubsub = worker_a._redis.pubsub
+        call_count = {"n": 0}
+
+        def flaky_pubsub(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RedisConnectionError("simulated drop")
+            return original_pubsub(*args, **kwargs)
+
+        worker_a._redis.pubsub = flaky_pubsub
+        original_backoff = module.RECONNECT_BACKOFF_SECONDS
+        module.RECONNECT_BACKOFF_SECONDS = 0.01
+        try:
+            # worker_a.start() already ran via run_with_workers; restart its
+            # listener task fresh so it hits the flaky pubsub from scratch.
+            worker_a._listener_task.cancel()
+            worker_a._listener_task = asyncio.create_task(worker_a._listen())
+            await asyncio.sleep(0.1)  # Let it fail once and reconnect.
+
+            alice = Peer(socket=FakeSocket())
+            bob = Peer(socket=FakeSocket())
+            await worker_a.join(alice, "ABC123", "Alice")
+            await worker_b.join(bob, "ABC123", "Bob")
+            await settle()
+
+            # Proves the reconnected listener is actually delivering again.
+            await worker_a.chat(alice, "still alive after reconnect")
+            payload = await asyncio.wait_for(
+                _first_matching(alice.socket, "chat", lambda p: p["text"] == "still alive after reconnect"),
+                timeout=2,
+            )
+            assert payload["sender"] == "Alice"
+            assert call_count["n"] >= 2
+        finally:
+            module.RECONNECT_BACKOFF_SECONDS = original_backoff
+            worker_a._redis.pubsub = original_pubsub
+
+    run_with_workers(worker_a, worker_b, scenario)
+
+
+async def _first_matching(socket, event_type, predicate):
+    while True:
+        for event in socket.events:
+            if event["type"] == event_type and predicate(event["payload"]):
+                return event["payload"]
+        await asyncio.sleep(0.02)

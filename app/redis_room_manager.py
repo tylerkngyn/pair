@@ -11,6 +11,7 @@ workers cannot both succeed for the same slot.
 
 import asyncio
 import json
+import logging
 import os
 import secrets
 import time
@@ -18,6 +19,17 @@ from dataclasses import dataclass, field
 
 from fastapi import WebSocket, WebSocketDisconnect
 from redis.asyncio import Redis
+from redis.exceptions import RedisError
+
+from app.metrics import Metrics
+
+logger = logging.getLogger(__name__)
+
+# Backoff before retrying the pub/sub listener or a reap sweep after a Redis
+# connection error, so a dropped connection is logged and retried rather than
+# silently killing the background task forever (the single biggest risk of
+# Redis being this deployment's one shared dependency — see README).
+RECONNECT_BACKOFF_SECONDS = 2
 
 CHANNEL_PREFIX = "chan:"
 ROOM_KEY_PREFIX = "room:"
@@ -74,6 +86,11 @@ class RedisRoomManager:
         self._local_peers: dict[str, list[Peer]] = {}
         self._listener_task: asyncio.Task | None = None
         self._reap_task: asyncio.Task | None = None
+        self.metrics = Metrics()
+        # Per-process view only: distinct rooms this worker currently holds
+        # at least one local peer for, consistent with the rest of these
+        # counters being per-worker rather than cluster-wide.
+        self.metrics.set_rooms_active_getter(lambda: len(self._local_peers))
 
     async def start(self) -> None:
         self._listener_task = asyncio.create_task(self._listen())
@@ -162,6 +179,7 @@ class RedisRoomManager:
                 continue  # Random name collided; the script already retried nothing, so loop.
             peer.handle, peer.room = attempt, code
             self._local_peers.setdefault(code, []).append(peer)
+            self.metrics.record_join()
             await self._publish(code, {
                 "type": "system", "payload": {"text": f"{attempt} joined the room"},
             })
@@ -227,18 +245,20 @@ class RedisRoomManager:
                 self._local_peers.pop(code, None)
         return match
 
-    async def _remove_from_redis(self, code: str, peer_id: str, handle: str) -> None:
+    async def _remove_from_redis(self, code: str, peer_id: str, handle: str) -> bool:
         """Drop a peer from Redis room membership and notify the room.
 
-        HDEL returning 0 means another caller (a disconnect racing a reap
-        sweep, or two sweeps) already removed this peer, so the rest is a
-        no-op — whoever's HDEL actually removed it owns the notifications.
+        Returns whether *this* call actually removed it. HDEL returning 0
+        means another caller (a disconnect racing a reap sweep, or two
+        concurrent sweeps) already removed this peer, so the rest is a
+        no-op — whoever's HDEL actually removed it owns the notifications
+        (and, for reap callers, the peers_reaped_total count).
         """
         key = self._room_key(code)
         removed = await self._redis.hdel(key, peer_id)
         await self._redis.delete(self._presence_key(code, peer_id))
         if not removed:
-            return
+            return False
         # Tells every worker (including ones that still hold this peer
         # locally, e.g. it's live on a *different* worker than the one
         # that just removed it) to drop it — see _handle_evict.
@@ -251,18 +271,21 @@ class RedisRoomManager:
             await self._publish(code, await self._room_state_event(code))
         else:
             await self._redis.delete(key)
+        return True
 
-    async def _remove_peer(self, code: str, peer_id: str, handle: str) -> None:
+    async def _remove_peer(self, code: str, peer_id: str, handle: str) -> bool:
         """Used by reap sweeps: removes from Redis AND closes a locally-held
         peer's socket, since (unlike disconnect()) nothing else owns that
         socket's lifecycle — its presence lapsed with no clean disconnect
-        ever running, e.g. the process got stuck.
+        ever running, e.g. the process got stuck. Returns whether this call
+        actually removed the peer from Redis (see _remove_from_redis).
         """
         stale_local = self._drop_local(code, peer_id)
-        await self._remove_from_redis(code, peer_id, handle)
+        removed = await self._remove_from_redis(code, peer_id, handle)
         if stale_local is not None:
             stale_local.room = None
             await self.close(stale_local, 1011)
+        return removed
 
     async def _handle_evict(self, code: str, peer_id: str) -> None:
         """Another worker's disconnect/reap already removed this peer from
@@ -279,7 +302,10 @@ class RedisRoomManager:
     async def _reap_loop(self) -> None:
         while True:
             await asyncio.sleep(REAP_INTERVAL_SECONDS)
-            await self._reap_once()
+            try:
+                await self._reap_once()
+            except RedisError:
+                logger.warning("Reap sweep failed; Redis unreachable, will retry next interval", exc_info=True)
 
     async def _reap_once(self) -> None:
         """Remove peers whose presence key lapsed, e.g. from a crashed worker.
@@ -288,6 +314,7 @@ class RedisRoomManager:
         crashed worker's own bookkeeping is gone, so only another worker's
         sweep can notice and clean up its peers.
         """
+        self.metrics.record_reap_sweep()
         async for key in self._redis.scan_iter(match=f"{ROOM_KEY_PREFIX}*"):
             code = key.removeprefix(ROOM_KEY_PREFIX)
             members = await self._redis.hgetall(key)
@@ -302,29 +329,46 @@ class RedisRoomManager:
             alive = await pipeline.execute()
             for (peer_id, handle), is_alive in zip(members.items(), alive):
                 if not is_alive:
-                    await self._remove_peer(code, peer_id, handle)
+                    if await self._remove_peer(code, peer_id, handle):
+                        self.metrics.record_peer_reaped()
 
     async def _listen(self) -> None:
-        async with self._redis.pubsub() as pubsub:
-            await pubsub.psubscribe(f"{CHANNEL_PREFIX}*")
-            async for message in pubsub.listen():
-                if message["type"] != "pmessage":
-                    continue
-                code = message["channel"].removeprefix(CHANNEL_PREFIX)
-                try:
-                    event = json.loads(message["data"])
-                except ValueError:
-                    continue
-                if event.get("type") == "_evict":
-                    await self._handle_evict(code, event["payload"]["peer_id"])
-                    continue
-                peers = self._local_peers.get(code)
-                if not peers:
-                    continue
-                failed = []
-                for p in list(peers):
-                    if not await self._send_raw(p, event):
-                        failed.append(p)
-                for p in failed:
-                    await self.disconnect(p)
-                    await self.close(p, 1011)
+        """Runs for the manager's lifetime. A dropped Redis connection would
+        otherwise raise out of `pubsub.listen()` and silently kill this
+        background task forever — every local peer would stop receiving any
+        room events with no signal anywhere. Log it and resubscribe instead.
+        """
+        while True:
+            try:
+                async with self._redis.pubsub() as pubsub:
+                    await pubsub.psubscribe(f"{CHANNEL_PREFIX}*")
+                    async for message in pubsub.listen():
+                        await self._handle_message(message)
+            except RedisError:
+                logger.warning(
+                    "Pub/sub listener lost its Redis connection; reconnecting in %ss",
+                    RECONNECT_BACKOFF_SECONDS, exc_info=True,
+                )
+                await asyncio.sleep(RECONNECT_BACKOFF_SECONDS)
+
+    async def _handle_message(self, message: dict) -> None:
+        if message["type"] != "pmessage":
+            return
+        code = message["channel"].removeprefix(CHANNEL_PREFIX)
+        try:
+            event = json.loads(message["data"])
+        except ValueError:
+            return
+        if event.get("type") == "_evict":
+            await self._handle_evict(code, event["payload"]["peer_id"])
+            return
+        peers = self._local_peers.get(code)
+        if not peers:
+            return
+        failed = []
+        for p in list(peers):
+            if not await self._send_raw(p, event):
+                failed.append(p)
+        for p in failed:
+            await self.disconnect(p)
+            await self.close(p, 1011)

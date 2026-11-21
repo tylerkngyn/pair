@@ -39,6 +39,24 @@ def test_http(client):
     assert '<form id="join-form">' in page.text
 
 
+def test_metrics_reflect_joins(client):
+    assert client.get("/metrics").json() == {
+        "rooms_active": 0, "peers_connected_total": 0,
+        "reap_sweeps_total": 0, "peers_reaped_total": 0,
+    }
+    with joined(client, room=" abc123 "):
+        metrics = client.get("/metrics").json()
+        assert metrics["rooms_active"] == 1
+        assert metrics["peers_connected_total"] == 1
+        with joined(client, "Bob"):
+            metrics = client.get("/metrics").json()
+            assert metrics["rooms_active"] == 1
+            assert metrics["peers_connected_total"] == 2
+    # reap_sweeps_total/peers_reaped_total stay 0: the in-process RoomManager
+    # has no reaping concept, unlike RedisRoomManager.
+    assert client.get("/metrics").json()["reap_sweeps_total"] == 0
+
+
 def test_pair_chat_capacity_disconnect_and_rejoin(client):
     with joined(client, room=" abc123 ") as (alice, waiting):
         assert waiting == {"room": "ABC123", "status": "waiting", "peers": ["Alice"]}
