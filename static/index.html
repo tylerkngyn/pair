@@ -3,36 +3,50 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#0c0c0c">
+  <meta name="theme-color" content="#1c1c1c">
   <title>Pair</title>
   <script>
     // Apply a saved preference before the page paints.
     try {
       if (localStorage.getItem('pair-theme') === 'light') {
         document.documentElement.dataset.theme = 'light';
-        document.querySelector('meta[name="theme-color"]').content = '#fafafa';
+        document.querySelector('meta[name="theme-color"]').content = '#e9e9e9';
       }
     } catch { /* Theme switching also works when storage is unavailable. */ }
   </script>
   <style>
-    :root { color-scheme:dark; --bg:#0c0c0c; --line:#333; --text:#f2f2f2; --muted:#aaa; --hover:#222; --primary-hover:#ccc; --message-line:#444; --sender:#ccc; font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace; }
-    :root[data-theme="light"] { color-scheme:light; --bg:#fafafa; --line:#ccc; --text:#171717; --muted:#666; --hover:#eee; --primary-hover:#333; --message-line:#bbb; --sender:#555; }
+    :root {
+      color-scheme:dark;
+      --bg:#1c1c1c; --field:#202020; --line:#3b3b3b; --control-line:#6b6b6b;
+      --text:#c9c9c9; --muted:#9a9a9a; --sender:#b5b5b5;
+      --hover:#292929; --primary:#b5b5b5; --primary-text:#202020; --primary-hover:#c2c2c2;
+      --message-line:#646464; --focus:#a3a3a3; --selection:#444;
+      font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;
+    }
+    :root[data-theme="light"] {
+      color-scheme:light;
+      --bg:#e9e9e9; --field:#e5e5e5; --line:#c5c5c5; --control-line:#808080;
+      --text:#454545; --muted:#666; --sender:#555;
+      --hover:#dedede; --primary:#565656; --primary-text:#ededed; --primary-hover:#484848;
+      --message-line:#8a8a8a; --focus:#707070; --selection:#c7c7c7;
+    }
     * { box-sizing:border-box; }
     [hidden] { display:none !important; }
+    ::selection { background:var(--selection); color:var(--text); }
     body { margin:0; min-height:100dvh; background:var(--bg); color:var(--text); font-size:16px; line-height:1.5; }
     header { display:flex; align-items:center; justify-content:space-between; padding:28px 32px; }
     .brand { font-size:21px; font-weight:700; letter-spacing:-1px; }
     #theme-toggle { padding:5px 8px; border:0; color:var(--muted); font-size:14px; }
     main { width:min(100% - 48px,720px); margin:clamp(48px,16vh,160px) auto 32px; }
     #join-view { width:min(100%,320px); margin:0 auto; }
-    button,input,textarea { font:inherit; border:1px solid var(--line); border-radius:3px; }
+    button,input,textarea { font:inherit; border:1px solid var(--control-line); border-radius:3px; }
     button { padding:11px 16px; background:transparent; color:var(--text); cursor:pointer; }
     button:hover:enabled { background:var(--hover); }
     button:disabled { opacity:.45; cursor:not-allowed; }
-    :focus-visible { outline:2px solid var(--text); outline-offset:3px; }
-    input,textarea { width:100%; background:transparent; color:var(--text); padding:13px 14px; }
+    :focus-visible { outline:2px solid var(--focus); outline-offset:3px; }
+    input,textarea { width:100%; background:var(--field); color:var(--text); padding:13px 14px; }
     input::placeholder,textarea::placeholder { color:var(--muted); opacity:1; }
-    .primary { background:var(--text); border-color:var(--text); color:var(--bg); }
+    .primary { background:var(--primary); border-color:var(--primary); color:var(--primary-text); }
     .primary:hover:enabled { background:var(--primary-hover); border-color:var(--primary-hover); }
     .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip-path:inset(50%); white-space:nowrap; border:0; }
     #join-form { display:grid; gap:12px; }
@@ -56,7 +70,6 @@
     textarea { resize:vertical; min-height:52px; max-height:180px; line-height:1.5; }
     .composer-meta { text-align:right; margin-top:8px; color:var(--muted); font-size:12px; }
     #count.over { color:var(--text); font-weight:700; }
-    #count.over { color:#fff; font-weight:700; }
     #typing-indicator { margin:0 0 4px; min-height:1.3em; }
     #reaction-bar { display:flex; gap:6px; padding-bottom:12px; }
     #reaction-bar button { padding:6px 10px; font-size:17px; line-height:1; }
@@ -99,7 +112,6 @@
     let connectTimeout = null;
     let joined = false;
     let selfHandle = '';
-<<<<<<< HEAD
 
     function updateThemeButton() {
       const light = document.documentElement.dataset.theme === 'light';
@@ -110,12 +122,10 @@
     $('theme-toggle').addEventListener('click', () => {
       const theme = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
       document.documentElement.dataset.theme = theme;
-      document.querySelector('meta[name="theme-color"]').content = theme === 'light' ? '#fafafa' : '#0c0c0c';
+      document.querySelector('meta[name="theme-color"]').content = getComputedStyle(document.documentElement).getPropertyValue('--bg').trim();
       try { localStorage.setItem('pair-theme', theme); } catch { /* Optional persistence. */ }
       updateThemeButton();
     });
-=======
-    let previousStatus = null;
     let typingTimeout = null;
     let sentTyping = false;
     let peerTypingTimeout = null;
@@ -153,7 +163,6 @@
       sentTyping = isTyping;
       socket.send(JSON.stringify({type:'typing', payload:{typing:isTyping}}));
     }
->>>>>>> origin/main
 
     function randomInt(max) { return crypto.getRandomValues(new Uint32Array(1))[0] % max; }
     function showError(text) { $('alert').textContent = text; $('alert').hidden = !text; }
@@ -226,11 +235,7 @@
       showError('');
       selfHandle = $('handle').value.trim() || `Player-${String(randomInt(10000)).padStart(4, '0')}`;
       const room = $('room-code').value.trim().toUpperCase();
-<<<<<<< HEAD
-=======
-      previousStatus = null;
       sentTyping = false;
->>>>>>> origin/main
       $('messages').replaceChildren();
       setPeerTyping('', false);
       setJoining(true);
