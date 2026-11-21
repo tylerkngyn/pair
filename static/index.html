@@ -56,6 +56,12 @@
     textarea { resize:vertical; min-height:52px; max-height:180px; line-height:1.5; }
     .composer-meta { text-align:right; margin-top:8px; color:var(--muted); font-size:12px; }
     #count.over { color:var(--text); font-weight:700; }
+    #count.over { color:#fff; font-weight:700; }
+    #typing-indicator { margin:0 0 4px; min-height:1.3em; }
+    #reaction-bar { display:flex; gap:6px; padding-bottom:12px; }
+    #reaction-bar button { padding:6px 10px; font-size:17px; line-height:1; }
+    .reaction-fly { position:fixed; left:50%; bottom:20%; font-size:28px; pointer-events:none; animation:float-up 1.4s ease-out forwards; z-index:10; }
+    @keyframes float-up { 0% { transform:translate(-50%,0) scale(.6); opacity:0; } 15% { transform:translate(-50%,-10px) scale(1); opacity:1; } 100% { transform:translate(-50%,-180px) scale(1); opacity:0; } }
     @media(max-width:480px) { header { padding:22px 24px; } main { margin-top:64px; } .room-meta { font-size:13px; } }
   </style>
 </head>
@@ -76,6 +82,8 @@
       <div class="panel-top"><h1 id="active-room" class="room-id"></h1><button id="leave" type="button">Leave room</button></div>
       <div class="room-meta"><span id="peers" role="status" aria-label="Room capacity"></span></div>
       <div id="messages" role="log" aria-label="Room messages" aria-live="polite" aria-relevant="additions text"></div>
+      <p id="typing-indicator" class="system" aria-live="polite" hidden></p>
+      <div id="reaction-bar" role="group" aria-label="Send a reaction"></div>
       <form id="chat-form" class="composer">
         <label class="sr-only" for="message">Message</label>
         <div class="composer-row"><textarea id="message" rows="1" placeholder="Message" disabled></textarea><button id="send" class="primary" type="submit" disabled>Send</button></div>
@@ -91,6 +99,7 @@
     let connectTimeout = null;
     let joined = false;
     let selfHandle = '';
+<<<<<<< HEAD
 
     function updateThemeButton() {
       const light = document.documentElement.dataset.theme === 'light';
@@ -105,6 +114,46 @@
       try { localStorage.setItem('pair-theme', theme); } catch { /* Optional persistence. */ }
       updateThemeButton();
     });
+=======
+    let previousStatus = null;
+    let typingTimeout = null;
+    let sentTyping = false;
+    let peerTypingTimeout = null;
+    const REACTIONS = ['👍', '❤️', '😂', '😮', '👏'];
+    for (const emoji of REACTIONS) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = emoji;
+      button.setAttribute('aria-label', `Send ${emoji} reaction`);
+      button.addEventListener('click', () => {
+        if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({type:'reaction', payload:{emoji}}));
+      });
+      $('reaction-bar').appendChild(button);
+    }
+    function flyReaction(emoji) {
+      const span = document.createElement('span');
+      span.className = 'reaction-fly';
+      span.textContent = emoji;
+      span.style.left = `${40 + Math.random() * 20}%`;
+      document.body.appendChild(span);
+      span.addEventListener('animationend', () => span.remove());
+    }
+    function setPeerTyping(sender, isTyping) {
+      clearTimeout(peerTypingTimeout);
+      if (isTyping) {
+        $('typing-indicator').textContent = `${sender} is typing…`;
+        $('typing-indicator').hidden = false;
+        peerTypingTimeout = setTimeout(() => { $('typing-indicator').hidden = true; }, 5000);
+      } else {
+        $('typing-indicator').hidden = true;
+      }
+    }
+    function sendTyping(isTyping) {
+      if (socket?.readyState !== WebSocket.OPEN || sentTyping === isTyping) return;
+      sentTyping = isTyping;
+      socket.send(JSON.stringify({type:'typing', payload:{typing:isTyping}}));
+    }
+>>>>>>> origin/main
 
     function randomInt(max) { return crypto.getRandomValues(new Uint32Array(1))[0] % max; }
     function showError(text) { $('alert').textContent = text; $('alert').hidden = !text; }
@@ -177,7 +226,13 @@
       showError('');
       selfHandle = $('handle').value.trim() || `Player-${String(randomInt(10000)).padStart(4, '0')}`;
       const room = $('room-code').value.trim().toUpperCase();
+<<<<<<< HEAD
+=======
+      previousStatus = null;
+      sentTyping = false;
+>>>>>>> origin/main
       $('messages').replaceChildren();
+      setPeerTyping('', false);
       setJoining(true);
       const scheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const ws = new WebSocket(`${scheme}//${window.location.host}/ws`);
@@ -199,8 +254,17 @@
         if (!data || typeof data.payload !== 'object' || data.payload === null) return;
         switch (data.type) {
           case 'room_state': applyRoomState(data.payload); break;
-          case 'chat': chatMessage(data.payload); break;
-          case 'system': systemMessage(data.payload.text); break;
+          case 'chat':
+            if (data.payload.sender !== selfHandle) setPeerTyping('', false);
+            chatMessage(data.payload);
+            break;
+          case 'system': systemMessage(data.payload.text); setPeerTyping('', false); break;
+          case 'typing':
+            if (data.payload.sender !== selfHandle) setPeerTyping(data.payload.sender, data.payload.typing);
+            break;
+          case 'reaction':
+            flyReaction(data.payload.emoji);
+            break;
           case 'error':
             showError(data.payload.message);
             if (!joined) ws.close();
@@ -213,6 +277,9 @@
         clearInterval(heartbeat); clearTimeout(connectTimeout);
         socket = null;
         setJoining(false);
+        sentTyping = false;
+        clearTimeout(typingTimeout);
+        setPeerTyping('', false);
         if (joined) {
           joined = false;
           $('message').disabled = true;
@@ -231,12 +298,24 @@
       try {
         socket.send(JSON.stringify({type:'chat', payload:{text:$('message').value}}));
         $('message').value = '';
+        clearTimeout(typingTimeout);
+        sendTyping(false);
         showError('');
       } catch { showError('Message could not be sent. Check your connection.'); }
       updateComposer();
       $('message').focus();
     });
-    $('message').addEventListener('input', updateComposer);
+    $('message').addEventListener('input', () => {
+      updateComposer();
+      if ($('message').value.trim()) {
+        sendTyping(true);
+        clearTimeout(typingTimeout);
+        typingTimeout = setTimeout(() => sendTyping(false), 3000);
+      } else {
+        clearTimeout(typingTimeout);
+        sendTyping(false);
+      }
+    });
     $('message').addEventListener('keydown', event => {
       if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
         event.preventDefault();
@@ -246,7 +325,9 @@
     $('leave').addEventListener('click', () => {
       const ws = socket;
       socket = null; joined = false;
-      clearInterval(heartbeat); clearTimeout(connectTimeout);
+      clearInterval(heartbeat); clearTimeout(connectTimeout); clearTimeout(typingTimeout);
+      sentTyping = false;
+      setPeerTyping('', false);
       if (ws) ws.close(1000, 'Left room');
       $('chat-view').hidden = true;
       $('join-view').hidden = false;

@@ -12,8 +12,9 @@ from dataclasses import dataclass, field
 from fastapi import WebSocket, WebSocketDisconnect
 
 from app.models import (
-    ChatBroadcast, ChatPayload, ErrorEvent, ErrorPayload, RoomStateEvent,
-    RoomStatePayload, ServerEvent, SystemEvent, SystemPayload,
+    ChatBroadcast, ChatPayload, ErrorEvent, ErrorPayload, ReactionBroadcast,
+    ReactionPayload, RoomStateEvent, RoomStatePayload, ServerEvent,
+    SystemEvent, SystemPayload, TypingBroadcast, TypingPayload,
 )
 
 
@@ -108,6 +109,30 @@ class RoomManager:
                 sender=peer.handle, text=text, timestamp=int(time.time()),
             )))
 
+    async def typing(self, peer: Peer, is_typing: bool) -> None:
+        code = peer.room
+        room = self._rooms.get(code) if code is not None else None
+        if room is None:
+            return
+        async with room.lock:
+            if peer not in room.peers:
+                return
+            await self._publish(room, TypingBroadcast(payload=TypingPayload(
+                sender=peer.handle, typing=is_typing,
+            )))
+
+    async def react(self, peer: Peer, emoji: str) -> None:
+        code = peer.room
+        room = self._rooms.get(code) if code is not None else None
+        if room is None:
+            return
+        async with room.lock:
+            if peer not in room.peers:
+                return
+            await self._publish(room, ReactionBroadcast(payload=ReactionPayload(
+                sender=peer.handle, emoji=emoji,
+            )))
+
     async def disconnect(self, peer: Peer) -> None:
         code = peer.room
         room = self._rooms.get(code) if code is not None else None
@@ -129,7 +154,7 @@ class RoomManager:
         notices for survivors. Iterate rather than recursively acquiring a lock.
         """
         events: list[ServerEvent] = [event]
-        refresh_state = not isinstance(event, ChatBroadcast)
+        refresh_state = not isinstance(event, (ChatBroadcast, TypingBroadcast, ReactionBroadcast))
         while room.peers:
             failed: list[Peer] = []
             for outgoing in events:

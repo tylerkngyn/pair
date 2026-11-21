@@ -107,6 +107,8 @@ Client events:
 ```json
 {"type":"join","payload":{"room":"ABC123","handle":"Alice"}}
 {"type":"chat","payload":{"text":"hello"}}
+{"type":"typing","payload":{"typing":true}}
+{"type":"reaction","payload":{"emoji":"👍"}}
 {"type":"ping","payload":{}}
 ```
 
@@ -117,6 +119,12 @@ sent and received messages remain unambiguous. Choose a different name to retry.
 Chat text must contain 1–500 Unicode code points and cannot be all whitespace.
 Text is preserved and rendered with `textContent`, never HTML.
 
+`typing` broadcasts the sender's in-progress state to the room; the client
+sends `true` while composing and `false` on send, idle, or clearing the
+field. `reaction` broadcasts a one-off emoji to the room and must be one of
+`👍 ❤️ 😂 😮 👏`; other values are rejected with `INVALID_MSG`. Both require
+having joined a room first and never trigger a `room_state` refresh.
+
 Server events:
 
 ```json
@@ -125,6 +133,8 @@ Server events:
 {"type":"chat","payload":{"sender":"Alice","text":"hello","timestamp":1700000000}}
 {"type":"system","payload":{"text":"Bob joined the room"}}
 {"type":"system","payload":{"text":"Bob left the room"}}
+{"type":"typing","payload":{"sender":"Alice","typing":true}}
+{"type":"reaction","payload":{"sender":"Alice","emoji":"👍"}}
 {"type":"error","payload":{"code":"ROOM_FULL","message":"Room is full"}}
 {"type":"error","payload":{"code":"INVALID_MSG","message":"..."}}
 ```
