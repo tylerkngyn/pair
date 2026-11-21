@@ -11,6 +11,7 @@ workers cannot both succeed for the same slot.
 
 import asyncio
 import json
+import os
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -22,9 +23,14 @@ CHANNEL_PREFIX = "chan:"
 ROOM_KEY_PREFIX = "room:"
 PRESENCE_KEY_PREFIX = "presence:"
 ROOM_TTL_SECONDS = 3600  # Safety net only; rooms are deleted explicitly on empty.
-PRESENCE_TTL_SECONDS = 90  # Browsers throttle backgrounded tabs' setInterval, often to ~60s;
-                           # must comfortably outlive that, not just one missed 20s ping.
-REAP_INTERVAL_SECONDS = 20  # Worst-case detection ~= PRESENCE_TTL + this, roughly two minutes.
+
+# Overridable only for integration tests, to avoid waiting out the real
+# ~2 minute worst case; production defaults are unchanged.
+PRESENCE_TTL_SECONDS = int(os.environ.get("PAIR_PRESENCE_TTL_SECONDS", "90"))
+# ^ Browsers throttle backgrounded tabs' setInterval, often to ~60s; must
+#   comfortably outlive that, not just one missed 20s ping.
+REAP_INTERVAL_SECONDS = int(os.environ.get("PAIR_REAP_INTERVAL_SECONDS", "20"))
+# ^ Worst-case detection ~= PRESENCE_TTL + this, roughly two minutes by default.
 
 # KEYS[1] = room hash key. KEYS[2] = presence key.
 # ARGV[1] = max peers. ARGV[2] = peer id. ARGV[3] = handle.
@@ -170,6 +176,10 @@ class RedisRoomManager:
         await self._redis.set(
             self._presence_key(peer.room, peer.id), 1, ex=PRESENCE_TTL_SECONDS,
         )
+        # Also extend the room hash's own safety-net TTL, or an active,
+        # long-lived paired session would still get wiped after ROOM_TTL_SECONDS
+        # regardless of how recently either peer pinged.
+        await self._redis.expire(self._room_key(peer.room), ROOM_TTL_SECONDS)
 
     async def chat(self, peer: Peer, text: str) -> None:
         if peer.room is None:
@@ -195,11 +205,17 @@ class RedisRoomManager:
         })
 
     async def disconnect(self, peer: Peer) -> None:
+        """A peer's own clean disconnect. The caller owns that peer's socket
+        lifecycle already (it's closing or already closed), so this only
+        drops bookkeeping and Redis membership — it never re-closes the
+        socket itself, unlike _remove_peer used by reap/eviction below.
+        """
         code = peer.room
         if code is None:
             return
         peer.room = None
-        await self._remove_peer(code, peer.id, peer.handle)
+        self._drop_local(code, peer.id)
+        await self._remove_from_redis(code, peer.id, peer.handle)
 
     def _drop_local(self, code: str, peer_id: str) -> Peer | None:
         """Remove a peer from this worker's own bookkeeping, if held locally."""
@@ -211,27 +227,22 @@ class RedisRoomManager:
                 self._local_peers.pop(code, None)
         return match
 
-    async def _remove_peer(self, code: str, peer_id: str, handle: str) -> None:
-        """Drop a peer from room membership; shared by disconnect() and reaping.
-
-        A reap sweep can land on a peer this very worker still holds
-        locally (its presence lapsed without a clean disconnect ever
-        running, e.g. the process got stuck). Evict it from local
-        bookkeeping and close its socket too, so it can never keep
-        receiving events or chatting after Redis has forgotten it.
+    async def _remove_from_redis(self, code: str, peer_id: str, handle: str) -> None:
+        """Drop a peer from Redis room membership and notify the room.
 
         HDEL returning 0 means another caller (a disconnect racing a reap
-        sweep, or two sweeps) already removed this peer, so this is a no-op.
+        sweep, or two sweeps) already removed this peer, so the rest is a
+        no-op — whoever's HDEL actually removed it owns the notifications.
         """
-        stale_local = self._drop_local(code, peer_id)
         key = self._room_key(code)
         removed = await self._redis.hdel(key, peer_id)
         await self._redis.delete(self._presence_key(code, peer_id))
-        if stale_local is not None:
-            stale_local.room = None
-            await self.close(stale_local, 1011)
         if not removed:
             return
+        # Tells every worker (including ones that still hold this peer
+        # locally, e.g. it's live on a *different* worker than the one
+        # that just removed it) to drop it — see _handle_evict.
+        await self._publish(code, {"type": "_evict", "payload": {"peer_id": peer_id}})
         await self._publish(code, {
             "type": "system", "payload": {"text": f"{handle} left the room"},
         })
@@ -240,6 +251,30 @@ class RedisRoomManager:
             await self._publish(code, await self._room_state_event(code))
         else:
             await self._redis.delete(key)
+
+    async def _remove_peer(self, code: str, peer_id: str, handle: str) -> None:
+        """Used by reap sweeps: removes from Redis AND closes a locally-held
+        peer's socket, since (unlike disconnect()) nothing else owns that
+        socket's lifecycle — its presence lapsed with no clean disconnect
+        ever running, e.g. the process got stuck.
+        """
+        stale_local = self._drop_local(code, peer_id)
+        await self._remove_from_redis(code, peer_id, handle)
+        if stale_local is not None:
+            stale_local.room = None
+            await self.close(stale_local, 1011)
+
+    async def _handle_evict(self, code: str, peer_id: str) -> None:
+        """Another worker's disconnect/reap already removed this peer from
+        Redis. If *this* worker still holds it locally (it's live here,
+        just owned by a different worker than the one that removed it),
+        drop and close it so it can never keep chatting after Redis has
+        forgotten it.
+        """
+        stale_local = self._drop_local(code, peer_id)
+        if stale_local is not None:
+            stale_local.room = None
+            await self.close(stale_local, 1011)
 
     async def _reap_loop(self) -> None:
         while True:
@@ -256,8 +291,17 @@ class RedisRoomManager:
         async for key in self._redis.scan_iter(match=f"{ROOM_KEY_PREFIX}*"):
             code = key.removeprefix(ROOM_KEY_PREFIX)
             members = await self._redis.hgetall(key)
-            for peer_id, handle in members.items():
-                if not await self._redis.exists(self._presence_key(code, peer_id)):
+            if not members:
+                continue
+            # One pipelined round trip for every member's presence check,
+            # instead of one EXISTS per peer, so a sweep's cost doesn't
+            # scale with total members across all rooms times a round trip.
+            pipeline = self._redis.pipeline(transaction=False)
+            for peer_id in members:
+                pipeline.exists(self._presence_key(code, peer_id))
+            alive = await pipeline.execute()
+            for (peer_id, handle), is_alive in zip(members.items(), alive):
+                if not is_alive:
                     await self._remove_peer(code, peer_id, handle)
 
     async def _listen(self) -> None:
@@ -267,12 +311,15 @@ class RedisRoomManager:
                 if message["type"] != "pmessage":
                     continue
                 code = message["channel"].removeprefix(CHANNEL_PREFIX)
-                peers = self._local_peers.get(code)
-                if not peers:
-                    continue
                 try:
                     event = json.loads(message["data"])
                 except ValueError:
+                    continue
+                if event.get("type") == "_evict":
+                    await self._handle_evict(code, event["payload"]["peer_id"])
+                    continue
+                peers = self._local_peers.get(code)
+                if not peers:
                     continue
                 failed = []
                 for p in list(peers):

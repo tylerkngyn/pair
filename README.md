@@ -194,13 +194,18 @@ worker/instance pointed at the same Redis:
   worker also runs a periodic sweep (every ~20s) across the whole room
   keyspace and removes any peer whose presence key lapsed — not just peers
   it holds locally, since a *crashed* worker's own bookkeeping is gone and
-  only another worker's sweep can notice. If a sweep does land on a peer
-  the sweeping worker still holds locally (a stuck process rather than a
-  true crash), it is evicted from that worker's local state and its socket
-  is closed, so it can never go on receiving events after Redis has
+  only another worker's sweep can notice. Whichever worker's sweep or
+  disconnect actually removes a peer from Redis also publishes an internal
+  eviction signal on the room's channel, so if that peer is really live
+  and held locally by a *different* worker (not the crashed/sweeping one),
+  that worker drops it and closes its socket too — otherwise it would keep
+  chatting as a zombie even after Redis and every other peer have
   forgotten it. Worst-case detection is roughly the TTL plus the sweep
   interval (around two minutes), during which a room with a crashed peer
-  can still look full to a new joiner.
+  can still look full to a new joiner. Every `ping`-triggered heartbeat
+  also refreshes the room hash's own safety-net TTL, not just the peer's
+  presence key, so a long-lived active room never expires out from under
+  two still-connected peers.
 
 This is still MVP-grade: no message history, no auth beyond the room code.
 `tests/test_redis_room_manager.py` exercises all of the above — including
@@ -208,3 +213,34 @@ simulated crashes — by running two `RedisRoomManager` instances against one
 shared [fakeredis](https://github.com/cunla/fakeredis-py) server to prove
 cross-worker join/chat/disconnect/reap behavior without real multi-process
 infra.
+
+### Real multi-process integration tests
+
+`tests/test_redis_room_manager.py` proves the algorithm is correct, but
+runs entirely in one process against a fake Redis and fake sockets. It
+can't catch a bug that only shows up across real separate OS processes, a
+real Redis connection over the network, or real WebSocket/TCP round trips.
+`tests/test_multiprocess_integration.py` closes that gap: it launches two
+actual `uvicorn app.main:app` processes on different ports, points both at
+one real Redis (a disposable `redis:7-alpine` Docker container, or an
+externally provided `PAIR_TEST_REDIS_URL`), and drives them with real
+WebSocket clients to prove cross-process chat delivery and that a crashed
+peer (its TCP connection aborted with no close handshake) actually gets
+reaped by the *other* process within a few seconds.
+
+This suite is opt-in — excluded from the default `pytest -q` run via
+`pytest.ini`'s `addopts = -m "not integration"`, since it needs Docker (or
+a real reachable Redis) and takes noticeably longer than the rest of the
+suite. Run it explicitly with:
+
+```sh
+python -m pytest -m integration -v
+```
+
+Without Docker running and without `PAIR_TEST_REDIS_URL` set, every test in
+this file skips cleanly rather than erroring. Two env vars exist purely to
+make the crash/reap scenario testable in seconds instead of the real ~2
+minute worst case — `PAIR_PRESENCE_TTL_SECONDS` and
+`PAIR_REAP_INTERVAL_SECONDS` override the constants of the same name in
+`app/redis_room_manager.py`; production behavior is unchanged unless they
+are explicitly set.
