@@ -138,6 +138,46 @@ def test_duplicate_names_and_repeated_join(client):
         assert len(expect(alice, "chat")["text"]) == 500
 
 
+def test_typing_and_reaction_broadcast(client):
+    with joined(client, room=" abc123 ") as (alice, _):
+        with joined(client, "Bob") as (bob, _):
+            expect(alice, "system")
+            expect(alice, "room_state")
+
+            alice.send_json({"type": "typing", "payload": {"typing": True}})
+            for socket in (alice, bob):
+                assert expect(socket, "typing") == {"sender": "Alice", "typing": True}
+
+            alice.send_json({"type": "typing", "payload": {"typing": False}})
+            for socket in (alice, bob):
+                assert expect(socket, "typing") == {"sender": "Alice", "typing": False}
+
+            bob.send_json({"type": "reaction", "payload": {"emoji": "👍"}})
+            for socket in (alice, bob):
+                assert expect(socket, "reaction") == {"sender": "Bob", "emoji": "👍"}
+
+
+@pytest.mark.parametrize("raw", [
+    '{"type":"typing","payload":{"typing":"yes"}}',
+    '{"type":"typing","payload":{}}',
+    '{"type":"reaction","payload":{"emoji":"🔥"}}',
+    '{"type":"reaction","payload":{"emoji":""}}',
+    '{"type":"reaction","payload":{}}',
+])
+def test_invalid_typing_and_reaction_payload(client, raw):
+    with joined(client) as (socket, _):
+        socket.send_text(raw)
+        assert expect(socket, "error")["code"] == "INVALID_MSG"
+
+
+def test_typing_and_reaction_require_join():
+    with TestClient(app) as client, client.websocket_connect("/ws") as socket:
+        socket.send_json({"type": "typing", "payload": {"typing": True}})
+        assert expect(socket, "error")["message"] == "Send a join event first"
+        socket.send_json({"type": "reaction", "payload": {"emoji": "👍"}})
+        assert expect(socket, "error")["message"] == "Send a join event first"
+
+
 def test_rooms_are_isolated(client):
     with joined(client) as (alice, _), joined(client, "Bob", "XYZ789") as (bob, state):
         assert state["peers"] == ["Bob"]
