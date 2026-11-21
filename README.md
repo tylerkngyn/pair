@@ -139,9 +139,11 @@ Server events:
 {"type":"error","payload":{"code":"INVALID_MSG","message":"..."}}
 ```
 
-Chats echo to the sender as confirmation. Timestamps are server-generated Unix
-seconds. On departure, the wire status returns to `waiting`; the UI shows
-`Peer disconnected · Waiting for peer` until a new peer joins. Browser heartbeats
+Chats echo to the sender as confirmation and label their handle with `(you)`.
+The light/dark toggle remembers your choice in the browser when storage is available.
+Timestamps are server-generated Unix seconds. On departure, the wire status
+returns to `waiting`; the UI updates the capacity and logs the departure.
+Browser heartbeats
 send `ping` every 20 seconds, with no protocol `pong`. The server closes sockets
 that send nothing for 60 seconds (15 seconds before joining). Physical network
 loss detection depends on WebSocket transport timeouts; clean closes notify
