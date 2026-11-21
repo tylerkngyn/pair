@@ -20,9 +20,15 @@ from redis.asyncio import Redis
 
 CHANNEL_PREFIX = "chan:"
 ROOM_KEY_PREFIX = "room:"
+PRESENCE_KEY_PREFIX = "presence:"
 ROOM_TTL_SECONDS = 3600  # Safety net only; rooms are deleted explicitly on empty.
+PRESENCE_TTL_SECONDS = 90  # Browsers throttle backgrounded tabs' setInterval, often to ~60s;
+                           # must comfortably outlive that, not just one missed 20s ping.
+REAP_INTERVAL_SECONDS = 20  # Worst-case detection ~= PRESENCE_TTL + this, roughly two minutes.
 
-# KEYS[1] = room hash key. ARGV[1] = max peers. ARGV[2] = peer id. ARGV[3] = handle.
+# KEYS[1] = room hash key. KEYS[2] = presence key.
+# ARGV[1] = max peers. ARGV[2] = peer id. ARGV[3] = handle.
+# ARGV[4] = room ttl. ARGV[5] = presence ttl.
 _JOIN_SCRIPT = """
 local count = redis.call('HLEN', KEYS[1])
 if count >= tonumber(ARGV[1]) then
@@ -36,6 +42,7 @@ for i = 1, #existing do
 end
 redis.call('HSET', KEYS[1], ARGV[2], ARGV[3])
 redis.call('EXPIRE', KEYS[1], ARGV[4])
+redis.call('SET', KEYS[2], 1, 'EX', ARGV[5])
 return 'OK'
 """
 
@@ -60,17 +67,20 @@ class RedisRoomManager:
         self._join_script = self._redis.register_script(_JOIN_SCRIPT)
         self._local_peers: dict[str, list[Peer]] = {}
         self._listener_task: asyncio.Task | None = None
+        self._reap_task: asyncio.Task | None = None
 
     async def start(self) -> None:
         self._listener_task = asyncio.create_task(self._listen())
+        self._reap_task = asyncio.create_task(self._reap_loop())
 
     async def stop(self) -> None:
-        if self._listener_task is not None:
-            self._listener_task.cancel()
-            try:
-                await self._listener_task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._listener_task, self._reap_task):
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         await self._redis.aclose()
 
     async def connect(self, socket: WebSocket) -> Peer:
@@ -106,6 +116,9 @@ class RedisRoomManager:
     def _room_key(self, code: str) -> str:
         return f"{ROOM_KEY_PREFIX}{code}"
 
+    def _presence_key(self, code: str, peer_id: str) -> str:
+        return f"{PRESENCE_KEY_PREFIX}{code}:{peer_id}"
+
     async def _publish(self, code: str, event: dict) -> None:
         await self._redis.publish(f"{CHANNEL_PREFIX}{code}", json.dumps(event))
 
@@ -126,10 +139,12 @@ class RedisRoomManager:
             return False
 
         key = self._room_key(code)
+        presence_key = self._presence_key(code, peer.id)
         for _ in range(10):
             attempt = handle or f"Player-{secrets.randbelow(10000):04d}"
             result = await self._join_script(
-                keys=[key], args=[self.MAX_PEERS, peer.id, attempt, ROOM_TTL_SECONDS],
+                keys=[key, presence_key],
+                args=[self.MAX_PEERS, peer.id, attempt, ROOM_TTL_SECONDS, PRESENCE_TTL_SECONDS],
             )
             if result == "FULL":
                 await self.error(peer, "Room is full", full=True)
@@ -148,6 +163,13 @@ class RedisRoomManager:
             return True
         await self.error(peer, "Could not assign a display name; try again")
         return False
+
+    async def heartbeat(self, peer: Peer) -> None:
+        if peer.room is None:
+            return
+        await self._redis.set(
+            self._presence_key(peer.room, peer.id), 1, ex=PRESENCE_TTL_SECONDS,
+        )
 
     async def chat(self, peer: Peer, text: str) -> None:
         if peer.room is None:
@@ -176,23 +198,67 @@ class RedisRoomManager:
         code = peer.room
         if code is None:
             return
+        peer.room = None
+        await self._remove_peer(code, peer.id, peer.handle)
+
+    def _drop_local(self, code: str, peer_id: str) -> Peer | None:
+        """Remove a peer from this worker's own bookkeeping, if held locally."""
         local = self._local_peers.get(code, [])
-        if peer in local:
-            local.remove(peer)
+        match = next((p for p in local if p.id == peer_id), None)
+        if match is not None:
+            local.remove(match)
             if not local:
                 self._local_peers.pop(code, None)
-        removed = await self._redis.hdel(self._room_key(code), peer.id)
-        peer.room = None
+        return match
+
+    async def _remove_peer(self, code: str, peer_id: str, handle: str) -> None:
+        """Drop a peer from room membership; shared by disconnect() and reaping.
+
+        A reap sweep can land on a peer this very worker still holds
+        locally (its presence lapsed without a clean disconnect ever
+        running, e.g. the process got stuck). Evict it from local
+        bookkeeping and close its socket too, so it can never keep
+        receiving events or chatting after Redis has forgotten it.
+
+        HDEL returning 0 means another caller (a disconnect racing a reap
+        sweep, or two sweeps) already removed this peer, so this is a no-op.
+        """
+        stale_local = self._drop_local(code, peer_id)
+        key = self._room_key(code)
+        removed = await self._redis.hdel(key, peer_id)
+        await self._redis.delete(self._presence_key(code, peer_id))
+        if stale_local is not None:
+            stale_local.room = None
+            await self.close(stale_local, 1011)
         if not removed:
             return
         await self._publish(code, {
-            "type": "system", "payload": {"text": f"{peer.handle} left the room"},
+            "type": "system", "payload": {"text": f"{handle} left the room"},
         })
-        remaining = await self._redis.hlen(self._room_key(code))
+        remaining = await self._redis.hlen(key)
         if remaining:
             await self._publish(code, await self._room_state_event(code))
         else:
-            await self._redis.delete(self._room_key(code))
+            await self._redis.delete(key)
+
+    async def _reap_loop(self) -> None:
+        while True:
+            await asyncio.sleep(REAP_INTERVAL_SECONDS)
+            await self._reap_once()
+
+    async def _reap_once(self) -> None:
+        """Remove peers whose presence key lapsed, e.g. from a crashed worker.
+
+        Scans the whole room keyspace, not just locally-held rooms: a
+        crashed worker's own bookkeeping is gone, so only another worker's
+        sweep can notice and clean up its peers.
+        """
+        async for key in self._redis.scan_iter(match=f"{ROOM_KEY_PREFIX}*"):
+            code = key.removeprefix(ROOM_KEY_PREFIX)
+            members = await self._redis.hgetall(key)
+            for peer_id, handle in members.items():
+                if not await self._redis.exists(self._presence_key(code, peer_id)):
+                    await self._remove_peer(code, peer_id, handle)
 
     async def _listen(self) -> None:
         async with self._redis.pubsub() as pubsub:

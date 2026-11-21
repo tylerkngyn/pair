@@ -185,10 +185,26 @@ worker/instance pointed at the same Redis:
   events only to the local sockets it holds.
 - A peer that disconnects is removed from Redis and the departure is
   published so peers on *other* workers see it too.
+- **Crash recovery**: each peer's connection carries a Redis presence key
+  (`presence:{room}:{peer_id}`, 90s TTL) refreshed on every browser `ping`.
+  The TTL is set well above the 20s ping interval because backgrounded
+  browser tabs commonly throttle `setInterval` to roughly once a minute —
+  a routine case, not a crash, and the margin must absorb it or a merely
+  backgrounded peer gets reaped out from under a still-open socket. Each
+  worker also runs a periodic sweep (every ~20s) across the whole room
+  keyspace and removes any peer whose presence key lapsed — not just peers
+  it holds locally, since a *crashed* worker's own bookkeeping is gone and
+  only another worker's sweep can notice. If a sweep does land on a peer
+  the sweeping worker still holds locally (a stuck process rather than a
+  true crash), it is evicted from that worker's local state and its socket
+  is closed, so it can never go on receiving events after Redis has
+  forgotten it. Worst-case detection is roughly the TTL plus the sweep
+  interval (around two minutes), during which a room with a crashed peer
+  can still look full to a new joiner.
 
-This is still MVP-grade: no message history, no auth beyond the room code,
-and a crashed worker's peers are not actively reaped (a production version
-would add presence TTLs/heartbeats). `tests/test_redis_room_manager.py`
-exercises this by running two `RedisRoomManager` instances against one
+This is still MVP-grade: no message history, no auth beyond the room code.
+`tests/test_redis_room_manager.py` exercises all of the above — including
+simulated crashes — by running two `RedisRoomManager` instances against one
 shared [fakeredis](https://github.com/cunla/fakeredis-py) server to prove
-cross-worker join/chat/disconnect behavior without real multi-process infra.
+cross-worker join/chat/disconnect/reap behavior without real multi-process
+infra.

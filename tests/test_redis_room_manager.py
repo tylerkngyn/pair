@@ -124,3 +124,156 @@ def test_cross_worker_disconnect_notifies_other_worker(two_workers):
         )
 
     run_with_workers(worker_a, worker_b, scenario)
+
+
+def test_join_sets_presence_key(two_workers):
+    worker_a, worker_b = two_workers
+
+    async def scenario():
+        alice = Peer(socket=FakeSocket())
+        assert await worker_a.join(alice, "ABC123", "Alice")
+        assert await worker_a._redis.exists(worker_a._presence_key("ABC123", alice.id))
+
+    run_with_workers(worker_a, worker_b, scenario)
+
+
+def test_heartbeat_refreshes_presence_ttl(two_workers):
+    worker_a, worker_b = two_workers
+
+    async def scenario():
+        alice = Peer(socket=FakeSocket())
+        await worker_a.join(alice, "ABC123", "Alice")
+        await worker_a.heartbeat(alice)
+        ttl = await worker_a._redis.ttl(worker_a._presence_key("ABC123", alice.id))
+        assert ttl > 0
+
+    run_with_workers(worker_a, worker_b, scenario)
+
+
+def test_reap_is_noop_while_presence_alive(two_workers):
+    worker_a, worker_b = two_workers
+
+    async def scenario():
+        alice = Peer(socket=FakeSocket())
+        bob = Peer(socket=FakeSocket())
+        await worker_a.join(alice, "ABC123", "Alice")
+        await worker_b.join(bob, "ABC123", "Bob")
+        await settle()
+        alice.socket.events.clear()
+        bob.socket.events.clear()
+
+        await worker_b._reap_once()
+        await settle()
+
+        assert await worker_a._redis.hlen(worker_a._room_key("ABC123")) == 2
+        assert alice.socket.events == []
+        assert bob.socket.events == []
+
+    run_with_workers(worker_a, worker_b, scenario)
+
+
+def test_reap_removes_crashed_peer_and_frees_capacity(two_workers):
+    worker_a, worker_b = two_workers
+
+    async def scenario():
+        alice = Peer(socket=FakeSocket())
+        bob = Peer(socket=FakeSocket())
+        await worker_a.join(alice, "ABC123", "Alice")
+        await worker_b.join(bob, "ABC123", "Bob")
+        await settle()
+
+        # Simulate worker_a crashing: its peer's presence lapses, but no
+        # clean disconnect() ever runs for it.
+        await worker_a._redis.delete(worker_a._presence_key("ABC123", alice.id))
+
+        await worker_b._reap_once()
+        await settle()
+
+        assert await worker_a._redis.hlen(worker_a._room_key("ABC123")) == 1
+        assert any(e["type"] == "system" and "Alice left" in e["payload"]["text"] for e in bob.socket.events)
+        assert any(
+            e["type"] == "room_state" and e["payload"]["status"] == "waiting" and e["payload"]["peers"] == ["Bob"]
+            for e in bob.socket.events
+        )
+
+        third = Peer(socket=FakeSocket())
+        assert await worker_b.join(third, "ABC123", "Eve")
+
+    run_with_workers(worker_a, worker_b, scenario)
+
+
+def test_reap_deletes_room_when_last_peer_stale(two_workers):
+    worker_a, worker_b = two_workers
+
+    async def scenario():
+        alice = Peer(socket=FakeSocket())
+        await worker_a.join(alice, "ABC123", "Alice")
+        await worker_a._redis.delete(worker_a._presence_key("ABC123", alice.id))
+
+        await worker_b._reap_once()
+
+        assert not await worker_a._redis.exists(worker_a._room_key("ABC123"))
+
+    run_with_workers(worker_a, worker_b, scenario)
+
+
+def test_reap_and_disconnect_race_is_idempotent(two_workers):
+    worker_a, worker_b = two_workers
+
+    async def scenario():
+        alice = Peer(socket=FakeSocket())
+        bob = Peer(socket=FakeSocket())
+        await worker_a.join(alice, "ABC123", "Alice")
+        await worker_b.join(bob, "ABC123", "Bob")
+        await settle()
+        bob.socket.events.clear()
+
+        await worker_a._redis.delete(worker_a._presence_key("ABC123", alice.id))
+        await worker_a.disconnect(alice)
+        await settle()
+        await worker_b._reap_once()
+        await settle()
+
+        left_events = [e for e in bob.socket.events if e["type"] == "system" and "Alice left" in e["payload"]["text"]]
+        assert len(left_events) == 1
+
+    run_with_workers(worker_a, worker_b, scenario)
+
+
+def test_reap_of_locally_held_peer_closes_its_socket(two_workers):
+    """A sweep can land on a peer the sweeping worker still holds locally
+    (a stuck process, not a true crash on another worker). That peer must
+    stop receiving events and its socket must close, or it becomes a
+    zombie: still live and chatting while Redis has forgotten it, letting
+    a third peer join a room that already has two live sockets.
+    """
+    worker_a, worker_b = two_workers
+
+    async def scenario():
+        alice = Peer(socket=FakeSocket())
+        bob = Peer(socket=FakeSocket())
+        await worker_a.join(alice, "ABC123", "Alice")
+        await worker_b.join(bob, "ABC123", "Bob")
+        await settle()
+
+        # Simulate alice's presence lapsing without disconnect() ever running,
+        # even though worker_a still holds her socket locally.
+        await worker_a._redis.delete(worker_a._presence_key("ABC123", alice.id))
+        await worker_a._reap_once()
+        await settle()
+
+        assert alice.id not in [p.id for p in worker_a._local_peers.get("ABC123", [])]
+        assert alice.socket.closed == 1011
+        assert alice.room is None
+
+        # Capacity is genuinely free: a third peer can join.
+        third = Peer(socket=FakeSocket())
+        assert await worker_b.join(third, "ABC123", "Eve")
+
+        # The zombie must not go on receiving room events.
+        events_before = len(alice.socket.events)
+        await worker_b.chat(bob, "hello after reap")
+        await settle()
+        assert len(alice.socket.events) == events_before
+
+    run_with_workers(worker_a, worker_b, scenario)
