@@ -14,8 +14,9 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-Open <http://127.0.0.1:8000>. Generate a code, enter a display name (or leave it
-blank), and join. In a second tab, enter the same code and a different name.
+Open <http://127.0.0.1:8000>. Choose any six-character alphanumeric room code,
+enter a name (or leave it blank), and join. In a second tab, enter the same code
+and a different name. A new room is created automatically when needed.
 Messages work while waiting, but are delivered only to peers currently present.
 A third peer receives `ROOM_FULL` / `Room is full`, then close code `1008`.
 Leave or refresh either tab; the survivor sees the departure and can pair again.

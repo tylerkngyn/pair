@@ -3,106 +3,76 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#101311">
-  <title>Pair — a room for two</title>
+  <meta name="theme-color" content="#0c0c0c">
+  <title>Pair</title>
   <style>
-    :root { color-scheme: dark; --bg:#101311; --panel:#171c18; --line:#323c33; --text:#edf2e9; --muted:#a1afa2; --green:#bded91; --red:#ffaaa1; font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace; }
+    :root { color-scheme:dark; --bg:#0c0c0c; --line:#333; --text:#f2f2f2; --muted:#aaa; font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace; }
     * { box-sizing:border-box; }
     [hidden] { display:none !important; }
-    body { margin:0; min-height:100dvh; background:var(--bg); color:var(--text); font-size:16px; line-height:1.6; }
-    button,input,textarea { font:inherit; }
-    button,input,textarea { border:1px solid var(--line); border-radius:5px; }
-    button { cursor:pointer; padding:11px 17px; background:transparent; color:var(--text); transition:background .15s; }
-    button:hover:enabled { background:#293329; }
-    button:disabled { opacity:.5; cursor:not-allowed; }
-    :focus-visible { outline:2px solid var(--green); outline-offset:4px; }
-    input,textarea { width:100%; background:#101511; color:var(--text); padding:13px 14px; }
-    input::placeholder,textarea::placeholder { color:#7d8d7f; opacity:1; }
-    .primary { background:var(--green); border-color:var(--green); color:#14200f; font-weight:700; }
-    .primary:hover:enabled { background:#d0ffa7; }
-    .shell { width:min(100% - 48px, 880px); margin:0 auto; }
-    header { display:flex; justify-content:space-between; align-items:center; padding:31px 0; border-bottom:1px solid var(--line); gap:16px; }
-    .brand { font-weight:700; font-size:21px; letter-spacing:-1px; }
-    .brand span { color:var(--green); }
-    .eyebrow { color:var(--muted); font-size:12px; letter-spacing:1.5px; text-transform:uppercase; }
-    main { padding:66px 0 28px; }
-    h1 { font-size:clamp(32px,6vw,49px); font-weight:500; letter-spacing:-2px; margin:0 0 13px; line-height:1.2; }
-    .intro { color:var(--muted); margin:0 0 35px; max-width:590px; }
-    .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden; }
-    .panel-top { padding:15px 24px; border-bottom:1px solid var(--line); display:flex; align-items:center; justify-content:space-between; gap:14px; font-size:14px; }
-    .indicator { display:inline-block; width:7px; height:7px; margin-right:9px; border-radius:50%; background:var(--muted); }
-    .indicator.live { background:var(--green); box-shadow:0 0 9px #bded9128; }
-    .indicator.warn { background:#e8c582; }
-    .form-body { padding:28px; }
-    label { display:block; font-size:14px; margin-bottom:9px; }
-    label span { color:var(--muted); }
-    .field { margin-bottom:25px; }
-    .code-row { display:flex; gap:10px; }
-    #room-code { text-transform:uppercase; letter-spacing:3px; min-width:0; }
-    #generate { white-space:nowrap; font-size:14px; }
-    .hint { color:var(--muted); font-size:13px; margin:9px 0 0; }
-    #join-button { width:100%; margin-top:3px; }
-    .under-panel { color:var(--muted); font-size:13px; margin:17px 0 0; }
-    footer { display:flex; justify-content:space-between; gap:20px; padding:23px 0 28px; color:var(--muted); font-size:12px; }
-    .alert { margin:0 0 22px; padding:12px 16px; color:var(--red); border:1px solid #68453f; border-radius:5px; background:#251a18; overflow-wrap:anywhere; }
-    #chat-view .panel-top { padding:17px 23px; }
-    .room-id { color:var(--green); letter-spacing:2px; font-size:19px; font-weight:700; }
-    .room-heading { display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
-    #leave { font-size:14px; padding:8px 12px; white-space:nowrap; }
-    .room-meta { display:flex; justify-content:space-between; gap:14px; flex-wrap:wrap; padding:11px 23px; border-bottom:1px solid var(--line); color:var(--muted); font-size:13px; }
+    body { margin:0; min-height:100dvh; background:var(--bg); color:var(--text); font-size:16px; line-height:1.5; }
+    header { padding:28px 32px; }
+    .brand { font-size:21px; font-weight:700; letter-spacing:-1px; }
+    main { width:min(100% - 48px,720px); margin:clamp(48px,16vh,160px) auto 32px; }
+    #join-view { width:min(100%,320px); margin:0 auto; }
+    button,input,textarea { font:inherit; border:1px solid var(--line); border-radius:3px; }
+    button { padding:11px 16px; background:transparent; color:var(--text); cursor:pointer; }
+    button:hover:enabled { background:#222; }
+    button:disabled { opacity:.45; cursor:not-allowed; }
+    :focus-visible { outline:2px solid #fff; outline-offset:3px; }
+    input,textarea { width:100%; background:transparent; color:var(--text); padding:13px 14px; }
+    input::placeholder,textarea::placeholder { color:var(--muted); opacity:1; }
+    .primary { background:var(--text); border-color:var(--text); color:#0c0c0c; }
+    .primary:hover:enabled { background:#ccc; border-color:#ccc; }
+    .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip-path:inset(50%); white-space:nowrap; border:0; }
+    #join-form { display:grid; gap:12px; }
+    #room-code { text-transform:uppercase; }
+    .alert { max-width:320px; margin:0 auto 24px; color:var(--text); font-size:14px; overflow-wrap:anywhere; }
+    .panel-top { display:flex; align-items:center; justify-content:space-between; gap:16px; padding-bottom:16px; border-bottom:1px solid var(--line); }
+    .room-id { margin:0; font-size:18px; font-weight:500; letter-spacing:2px; }
+    #leave { padding:7px 11px; font-size:14px; }
+    .room-meta { display:flex; justify-content:space-between; flex-wrap:wrap; gap:8px 20px; padding:12px 0; color:var(--muted); font-size:14px; }
     #room-status { color:var(--text); }
-    #messages { height:clamp(240px,43dvh,490px); overflow-y:auto; padding:22px 23px; scrollbar-color:var(--line) transparent; }
-    .empty { color:var(--muted); padding:27px 0; font-size:14px; }
-    .empty strong { display:block; color:var(--text); font-weight:400; margin-bottom:7px; }
+    #peers { overflow-wrap:anywhere; min-width:0; }
+    #messages { height:clamp(220px,40dvh,460px); overflow-y:auto; padding:4px 0 16px; scrollbar-color:#444 transparent; }
     .system { color:var(--muted); font-size:13px; margin:12px 0; overflow-wrap:anywhere; }
-    .system::before { content:"* "; color:var(--green); }
-    .message { margin:18px 0; padding-left:13px; border-left:2px solid #526253; }
-    .message.mine { border-left-color:var(--green); }
-    .message-head { display:flex; gap:12px; align-items:baseline; flex-wrap:wrap; font-size:13px; color:var(--muted); }
-    .sender { color:var(--text); font-size:14px; overflow-wrap:anywhere; }
-    .mine .sender { color:var(--green); }
-    .message p { white-space:pre-wrap; overflow-wrap:anywhere; margin:4px 0 0; }
-    .composer { padding:19px 23px; border-top:1px solid var(--line); }
+    .message { margin:20px 0; padding-left:12px; border-left:2px solid #444; }
+    .message.mine { border-left-color:#eee; }
+    .message-head { display:flex; flex-wrap:wrap; gap:12px; align-items:baseline; color:var(--muted); font-size:13px; }
+    .sender { color:#ccc; font-size:14px; overflow-wrap:anywhere; }
+    .mine .sender { color:#fff; }
+    .message p { margin:4px 0 0; white-space:pre-wrap; overflow-wrap:anywhere; }
+    .composer { padding-top:16px; border-top:1px solid var(--line); }
     .composer-row { display:flex; gap:10px; align-items:stretch; }
-    textarea { resize:vertical; min-height:55px; max-height:180px; line-height:1.6; }
-    .composer label { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); }
-    .composer-meta { display:flex; justify-content:space-between; gap:12px; color:var(--muted); font-size:12px; margin-top:8px; }
-    #count.over { color:var(--red); }
-    #chat-view h1 { font-size:28px; letter-spacing:-1px; margin-bottom:23px; }
-    @media(max-width:540px) { .shell { width:calc(100% - 28px); } header { padding:21px 0; } header .eyebrow { font-size:10px; letter-spacing:1px; } main { padding-top:35px; } .form-body { padding:21px; } .code-row { flex-direction:column; } #generate { align-self:flex-start; } .panel-top,.room-meta,#messages,.composer { padding-left:16px !important; padding-right:16px !important; } .room-heading { gap:9px; } .composer-meta span:first-child { max-width:210px; } footer { flex-wrap:wrap; gap:5px; } }
+    textarea { resize:vertical; min-height:52px; max-height:180px; line-height:1.5; }
+    .composer-meta { text-align:right; margin-top:8px; color:var(--muted); font-size:12px; }
+    #count.over { color:#fff; font-weight:700; }
+    @media(max-width:480px) { header { padding:22px 24px; } main { margin-top:64px; } .room-meta { font-size:13px; } }
   </style>
 </head>
 <body>
-  <div class="shell">
-    <header><div class="brand"><span>pair</span>://</div><div class="eyebrow">Text only · Two peers</div></header>
-    <main>
-      <div id="alert" class="alert" role="alert" hidden></div>
-      <section id="join-view" aria-labelledby="join-title">
-        <h1 id="join-title">A room for two.</h1>
-        <p class="intro">Same code. Different screens. Start a conversation.</p>
-        <div class="panel">
-          <div class="panel-top"><span><span class="indicator" id="join-indicator"></span><span id="join-status" role="status">Ready to connect</span></span><span class="eyebrow">New session</span></div>
-          <form id="join-form" class="form-body">
-            <div class="field"><label for="handle">Display name <span>/ optional</span></label><input id="handle" name="handle" maxlength="32" placeholder="e.g. Alice" autocomplete="nickname"><p class="hint">Leave blank for a random Player handle.</p></div>
-            <div class="field"><label for="room-code">Room code</label><div class="code-row"><input id="room-code" name="room" minlength="6" maxlength="6" pattern="[A-Za-z0-9]{6}" placeholder="ABC123" required autocomplete="off" autocapitalize="characters" spellcheck="false" aria-describedby="code-hint"><button id="generate" type="button">Generate code</button></div><p id="code-hint" class="hint">Share this 6-character code with your other peer.</p></div>
-            <button id="join-button" class="primary" type="submit">Join room</button>
-          </form>
-        </div>
-        <p class="under-panel">No account. No message history. Just this session.</p>
-      </section>
-      <section id="chat-view" aria-labelledby="chat-title" hidden>
-        <h1 id="chat-title" tabindex="-1">You’re in.</h1>
-        <div class="panel">
-          <div class="panel-top"><div class="room-heading"><span class="eyebrow">Room</span><span id="active-room" class="room-id"></span></div><button id="leave" type="button">Leave room</button></div>
-          <div class="room-meta"><span><span id="room-indicator" class="indicator warn"></span><span id="room-status" role="status">Waiting for peer</span></span><span id="peers"></span></div>
-          <div id="messages" role="log" aria-label="Room messages" aria-live="polite" aria-relevant="additions text"><div id="empty" class="empty"><strong>Your session starts here.</strong>Messages sent while waiting will not be replayed to a peer who joins later.</div></div>
-          <form id="chat-form" class="composer"><label for="message">Message</label><div class="composer-row"><textarea id="message" rows="1" placeholder="Say something…" disabled></textarea><button id="send" class="primary" type="submit" disabled>Send</button></div><div class="composer-meta"><span>Enter to send · Shift + Enter for a new line</span><span id="count">0 / 500</span></div></form>
-        </div>
-        <p id="identity" class="under-panel"></p>
-      </section>
-    </main>
-    <footer><span>A small space for a real conversation.</span><span>Ephemeral by design.</span></footer>
-  </div>
+  <header><div class="brand">pair://</div></header>
+  <main>
+    <div id="alert" class="alert" role="alert" hidden></div>
+    <section id="join-view" aria-label="Join room">
+      <form id="join-form">
+        <label class="sr-only" for="handle">Name</label>
+        <input id="handle" name="handle" maxlength="32" placeholder="Name" autocomplete="nickname">
+        <label class="sr-only" for="room-code">Room code</label>
+        <input id="room-code" name="room" minlength="6" maxlength="6" pattern="[A-Za-z0-9]{6}" placeholder="Room code" title="6 letters or numbers" required autocomplete="off" autocapitalize="characters" spellcheck="false">
+        <button id="join-button" class="primary" type="submit">Join room</button>
+      </form>
+    </section>
+    <section id="chat-view" aria-label="Room chat" hidden>
+      <div class="panel-top"><h1 id="active-room" class="room-id"></h1><button id="leave" type="button">Leave room</button></div>
+      <div class="room-meta"><span id="room-status" role="status">Waiting for peer</span><span id="peers"></span></div>
+      <div id="messages" role="log" aria-label="Room messages" aria-live="polite" aria-relevant="additions text"></div>
+      <form id="chat-form" class="composer">
+        <label class="sr-only" for="message">Message</label>
+        <div class="composer-row"><textarea id="message" rows="1" placeholder="Message" disabled></textarea><button id="send" class="primary" type="submit" disabled>Send</button></div>
+        <div class="composer-meta"><span id="count">0 / 500</span></div>
+      </form>
+    </section>
+  </main>
   <script>
     'use strict';
     const $ = id => document.getElementById(id);
@@ -117,12 +87,9 @@
     function showError(text) { $('alert').textContent = text; $('alert').hidden = !text; }
     function setJoining(busy) {
       $('join-button').disabled = busy;
-      $('generate').disabled = busy;
       $('handle').disabled = busy;
       $('room-code').disabled = busy;
       $('join-button').textContent = busy ? 'Connecting…' : 'Join room';
-      $('join-status').textContent = busy ? 'Opening connection…' : 'Ready to connect';
-      $('join-indicator').className = `indicator${busy ? ' warn' : ''}`;
     }
     function updateComposer() {
       const length = Array.from($('message').value).length;
@@ -145,7 +112,6 @@
       appendEntry(entry);
     }
     function chatMessage(payload) {
-      $('empty')?.remove();
       const mine = payload.sender === selfHandle;
       const entry = document.createElement('article');
       entry.className = `message${mine ? ' mine' : ''}`;
@@ -174,25 +140,18 @@
         $('join-view').hidden = true;
         $('chat-view').hidden = false;
         $('active-room').textContent = payload.room;
-        $('identity').textContent = `Connected as ${selfHandle}. Messages stay in this browser session only.`;
         $('message').disabled = false;
         $('message').focus();
       }
-      let status = payload.status === 'paired' ? 'Paired · Connected' : 'Waiting for peer';
+      let status = payload.status === 'paired' ? 'Paired' : 'Waiting for peer';
       if (payload.status === 'waiting' && previousStatus === 'paired') status = 'Peer disconnected · Waiting for peer';
       // Keep the departure state visible until another peer joins.
       if (payload.status === 'waiting' && previousStatus === 'peer_disconnected') status = 'Peer disconnected · Waiting for peer';
       previousStatus = status.startsWith('Peer disconnected') ? 'peer_disconnected' : payload.status;
       $('room-status').textContent = status;
-      $('room-indicator').className = `indicator ${payload.status === 'paired' ? 'live' : 'warn'}`;
       $('peers').textContent = `${payload.peers.length}/2 · ${payload.peers.join(', ')}`;
       updateComposer();
     }
-    $('generate').addEventListener('click', () => {
-      const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-      $('room-code').value = Array.from({length:6}, () => alphabet[randomInt(alphabet.length)]).join('');
-      $('room-code').focus();
-    });
     $('room-code').addEventListener('input', () => { $('room-code').value = $('room-code').value.toUpperCase(); });
     $('join-form').addEventListener('submit', event => {
       event.preventDefault();
@@ -202,10 +161,6 @@
       const room = $('room-code').value.trim().toUpperCase();
       previousStatus = null;
       $('messages').replaceChildren();
-      const empty = document.createElement('div');
-      empty.id = 'empty'; empty.className = 'empty';
-      empty.textContent = 'Share your room code to pair up. Messages sent now will not be replayed to a peer who joins later.';
-      $('messages').appendChild(empty);
       setJoining(true);
       const scheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const ws = new WebSocket(`${scheme}//${window.location.host}/ws`);
@@ -245,7 +200,6 @@
           joined = false;
           $('message').disabled = true;
           $('room-status').textContent = 'Disconnected';
-          $('room-indicator').className = 'indicator';
           $('leave').textContent = 'Back to join';
           systemMessage('Connection closed. Return to join to reconnect.');
         } else if ($('alert').hidden) showError('Unable to join. Check your connection and try again.');

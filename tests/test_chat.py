@@ -36,7 +36,7 @@ def test_http(client):
     page = client.get("/")
     assert page.status_code == 200
     assert "text/html" in page.headers["content-type"]
-    assert "A room for two." in page.text
+    assert '<form id="join-form">' in page.text
 
 
 def test_pair_chat_capacity_disconnect_and_rejoin(client):
