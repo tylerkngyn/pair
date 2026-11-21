@@ -277,3 +277,61 @@ def test_reap_of_locally_held_peer_closes_its_socket(two_workers):
         assert len(alice.socket.events) == events_before
 
     run_with_workers(worker_a, worker_b, scenario)
+
+
+def test_reap_evicts_peer_held_by_a_different_worker(two_workers):
+    """The sweeping worker only ever sees Redis membership directly; the
+    actual live peer may be held locally by a DIFFERENT worker than the
+    one whose sweep notices the lapsed presence key. That other worker
+    must still be told to drop and close it, or it becomes a zombie: live
+    and chatting on worker_a while worker_b's sweep has already told Redis
+    (and everyone else) that it's gone.
+    """
+    worker_a, worker_b = two_workers
+
+    async def scenario():
+        alice = Peer(socket=FakeSocket())
+        bob = Peer(socket=FakeSocket())
+        await worker_a.join(alice, "ABC123", "Alice")
+        await worker_b.join(bob, "ABC123", "Bob")
+        await settle()
+
+        await worker_a._redis.delete(worker_a._presence_key("ABC123", alice.id))
+        # worker_b's sweep notices and removes alice from Redis, even though
+        # alice's actual socket is held locally by worker_a, not worker_b.
+        await worker_b._reap_once()
+        await settle()
+
+        assert alice.id not in [p.id for p in worker_a._local_peers.get("ABC123", [])]
+        assert alice.socket.closed == 1011
+        assert alice.room is None
+
+        third = Peer(socket=FakeSocket())
+        assert await worker_a.join(third, "ABC123", "Eve")
+
+        events_before = len(alice.socket.events)
+        await worker_b.chat(bob, "hello after cross-worker reap")
+        await settle()
+        assert len(alice.socket.events) == events_before
+
+    run_with_workers(worker_a, worker_b, scenario)
+
+
+def test_heartbeat_extends_room_ttl(two_workers):
+    """A long-lived, active, paired room must not expire out from under two
+    still-connected peers just because no third join has happened recently
+    to refresh the room hash's own safety-net TTL.
+    """
+    worker_a, worker_b = two_workers
+
+    async def scenario():
+        alice = Peer(socket=FakeSocket())
+        await worker_a.join(alice, "ABC123", "Alice")
+
+        await worker_a._redis.expire(worker_a._room_key("ABC123"), 5)
+        await worker_a.heartbeat(alice)
+
+        ttl = await worker_a._redis.ttl(worker_a._room_key("ABC123"))
+        assert ttl > 5
+
+    run_with_workers(worker_a, worker_b, scenario)
