@@ -5,24 +5,35 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#0c0c0c">
   <title>Pair</title>
+  <script>
+    // Apply a saved preference before the page paints.
+    try {
+      if (localStorage.getItem('pair-theme') === 'light') {
+        document.documentElement.dataset.theme = 'light';
+        document.querySelector('meta[name="theme-color"]').content = '#fafafa';
+      }
+    } catch { /* Theme switching also works when storage is unavailable. */ }
+  </script>
   <style>
-    :root { color-scheme:dark; --bg:#0c0c0c; --line:#333; --text:#f2f2f2; --muted:#aaa; font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace; }
+    :root { color-scheme:dark; --bg:#0c0c0c; --line:#333; --text:#f2f2f2; --muted:#aaa; --hover:#222; --primary-hover:#ccc; --message-line:#444; --sender:#ccc; font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace; }
+    :root[data-theme="light"] { color-scheme:light; --bg:#fafafa; --line:#ccc; --text:#171717; --muted:#666; --hover:#eee; --primary-hover:#333; --message-line:#bbb; --sender:#555; }
     * { box-sizing:border-box; }
     [hidden] { display:none !important; }
     body { margin:0; min-height:100dvh; background:var(--bg); color:var(--text); font-size:16px; line-height:1.5; }
-    header { padding:28px 32px; }
+    header { display:flex; align-items:center; justify-content:space-between; padding:28px 32px; }
     .brand { font-size:21px; font-weight:700; letter-spacing:-1px; }
+    #theme-toggle { padding:5px 8px; border:0; color:var(--muted); font-size:14px; }
     main { width:min(100% - 48px,720px); margin:clamp(48px,16vh,160px) auto 32px; }
     #join-view { width:min(100%,320px); margin:0 auto; }
     button,input,textarea { font:inherit; border:1px solid var(--line); border-radius:3px; }
     button { padding:11px 16px; background:transparent; color:var(--text); cursor:pointer; }
-    button:hover:enabled { background:#222; }
+    button:hover:enabled { background:var(--hover); }
     button:disabled { opacity:.45; cursor:not-allowed; }
-    :focus-visible { outline:2px solid #fff; outline-offset:3px; }
+    :focus-visible { outline:2px solid var(--text); outline-offset:3px; }
     input,textarea { width:100%; background:transparent; color:var(--text); padding:13px 14px; }
     input::placeholder,textarea::placeholder { color:var(--muted); opacity:1; }
-    .primary { background:var(--text); border-color:var(--text); color:#0c0c0c; }
-    .primary:hover:enabled { background:#ccc; border-color:#ccc; }
+    .primary { background:var(--text); border-color:var(--text); color:var(--bg); }
+    .primary:hover:enabled { background:var(--primary-hover); border-color:var(--primary-hover); }
     .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip-path:inset(50%); white-space:nowrap; border:0; }
     #join-form { display:grid; gap:12px; }
     #room-code { text-transform:uppercase; }
@@ -30,27 +41,26 @@
     .panel-top { display:flex; align-items:center; justify-content:space-between; gap:16px; padding-bottom:16px; border-bottom:1px solid var(--line); }
     .room-id { margin:0; font-size:18px; font-weight:500; letter-spacing:2px; }
     #leave { padding:7px 11px; font-size:14px; }
-    .room-meta { display:flex; justify-content:space-between; flex-wrap:wrap; gap:8px 20px; padding:12px 0; color:var(--muted); font-size:14px; }
-    #room-status { color:var(--text); }
+    .room-meta { display:flex; justify-content:flex-end; padding:12px 0; color:var(--muted); font-size:14px; }
     #peers { overflow-wrap:anywhere; min-width:0; }
-    #messages { height:clamp(220px,40dvh,460px); overflow-y:auto; padding:4px 0 16px; scrollbar-color:#444 transparent; }
+    #messages { height:clamp(220px,40dvh,460px); overflow-y:auto; padding:4px 0 16px; scrollbar-color:var(--message-line) transparent; }
     .system { color:var(--muted); font-size:13px; margin:12px 0; overflow-wrap:anywhere; }
-    .message { margin:20px 0; padding-left:12px; border-left:2px solid #444; }
-    .message.mine { border-left-color:#eee; }
+    .message { margin:20px 0; padding-left:12px; border-left:2px solid var(--message-line); }
+    .message.mine { border-left-color:var(--text); }
     .message-head { display:flex; flex-wrap:wrap; gap:12px; align-items:baseline; color:var(--muted); font-size:13px; }
-    .sender { color:#ccc; font-size:14px; overflow-wrap:anywhere; }
-    .mine .sender { color:#fff; }
+    .sender { color:var(--sender); font-size:14px; overflow-wrap:anywhere; }
+    .mine .sender { color:var(--text); }
     .message p { margin:4px 0 0; white-space:pre-wrap; overflow-wrap:anywhere; }
     .composer { padding-top:16px; border-top:1px solid var(--line); }
     .composer-row { display:flex; gap:10px; align-items:stretch; }
     textarea { resize:vertical; min-height:52px; max-height:180px; line-height:1.5; }
     .composer-meta { text-align:right; margin-top:8px; color:var(--muted); font-size:12px; }
-    #count.over { color:#fff; font-weight:700; }
+    #count.over { color:var(--text); font-weight:700; }
     @media(max-width:480px) { header { padding:22px 24px; } main { margin-top:64px; } .room-meta { font-size:13px; } }
   </style>
 </head>
 <body>
-  <header><div class="brand">pair://</div></header>
+  <header><div class="brand">pair://</div><button id="theme-toggle" type="button" aria-label="Switch to light mode">Light</button></header>
   <main>
     <div id="alert" class="alert" role="alert" hidden></div>
     <section id="join-view" aria-label="Join room">
@@ -64,7 +74,7 @@
     </section>
     <section id="chat-view" aria-label="Room chat" hidden>
       <div class="panel-top"><h1 id="active-room" class="room-id"></h1><button id="leave" type="button">Leave room</button></div>
-      <div class="room-meta"><span id="room-status" role="status">Waiting for peer</span><span id="peers"></span></div>
+      <div class="room-meta"><span id="peers" role="status" aria-label="Room capacity"></span></div>
       <div id="messages" role="log" aria-label="Room messages" aria-live="polite" aria-relevant="additions text"></div>
       <form id="chat-form" class="composer">
         <label class="sr-only" for="message">Message</label>
@@ -81,7 +91,20 @@
     let connectTimeout = null;
     let joined = false;
     let selfHandle = '';
-    let previousStatus = null;
+
+    function updateThemeButton() {
+      const light = document.documentElement.dataset.theme === 'light';
+      $('theme-toggle').textContent = light ? 'Dark' : 'Light';
+      $('theme-toggle').setAttribute('aria-label', `Switch to ${light ? 'dark' : 'light'} mode`);
+    }
+    updateThemeButton();
+    $('theme-toggle').addEventListener('click', () => {
+      const theme = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
+      document.documentElement.dataset.theme = theme;
+      document.querySelector('meta[name="theme-color"]').content = theme === 'light' ? '#fafafa' : '#0c0c0c';
+      try { localStorage.setItem('pair-theme', theme); } catch { /* Optional persistence. */ }
+      updateThemeButton();
+    });
 
     function randomInt(max) { return crypto.getRandomValues(new Uint32Array(1))[0] % max; }
     function showError(text) { $('alert').textContent = text; $('alert').hidden = !text; }
@@ -119,7 +142,7 @@
       head.className = 'message-head';
       const name = document.createElement('span');
       name.className = 'sender';
-      name.textContent = payload.sender + (mine ? ' / you' : '');
+      name.textContent = payload.sender + (mine ? ' (you)' : '');
       const timestamp = document.createElement('time');
       const date = new Date(payload.timestamp * 1000);
       timestamp.dateTime = date.toISOString();
@@ -143,13 +166,8 @@
         $('message').disabled = false;
         $('message').focus();
       }
-      let status = payload.status === 'paired' ? 'Paired' : 'Waiting for peer';
-      if (payload.status === 'waiting' && previousStatus === 'paired') status = 'Peer disconnected · Waiting for peer';
-      // Keep the departure state visible until another peer joins.
-      if (payload.status === 'waiting' && previousStatus === 'peer_disconnected') status = 'Peer disconnected · Waiting for peer';
-      previousStatus = status.startsWith('Peer disconnected') ? 'peer_disconnected' : payload.status;
-      $('room-status').textContent = status;
-      $('peers').textContent = `${payload.peers.length}/2 · ${payload.peers.join(', ')}`;
+      $('peers').textContent = `${payload.peers.length}/2`;
+      $('peers').setAttribute('aria-label', `${payload.peers.length} of 2 participants`);
       updateComposer();
     }
     $('room-code').addEventListener('input', () => { $('room-code').value = $('room-code').value.toUpperCase(); });
@@ -159,7 +177,6 @@
       showError('');
       selfHandle = $('handle').value.trim() || `Player-${String(randomInt(10000)).padStart(4, '0')}`;
       const room = $('room-code').value.trim().toUpperCase();
-      previousStatus = null;
       $('messages').replaceChildren();
       setJoining(true);
       const scheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -199,7 +216,8 @@
         if (joined) {
           joined = false;
           $('message').disabled = true;
-          $('room-status').textContent = 'Disconnected';
+          $('peers').textContent = 'Disconnected';
+          $('peers').setAttribute('aria-label', 'Disconnected');
           $('leave').textContent = 'Back to join';
           systemMessage('Connection closed. Return to join to reconnect.');
         } else if ($('alert').hidden) showError('Unable to join. Check your connection and try again.');
