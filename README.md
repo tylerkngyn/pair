@@ -34,6 +34,45 @@ the same network; guest Wi-Fi/client isolation may prevent connections. Browse
 to the actual LAN IP, not `0.0.0.0`. HTTPS automatically uses `wss://`; an HTTPS
 deployment needs a reverse proxy that forwards WebSocket upgrade requests.
 
+### Devices that can't reach each other on LAN
+
+Some networks (guest Wi-Fi, many offices/cafes) isolate client devices from
+each other even on the same SSID, so the LAN IP approach above won't connect.
+Two ways around it:
+
+**Quick/temporary — tunnel the local server:**
+
+```sh
+brew install ngrok
+ngrok config add-authtoken <your-authtoken>   # from the ngrok dashboard
+uvicorn app.main:app --host 0.0.0.0 --port 8000 &
+ngrok http 8000
+```
+
+Share the `https://*.ngrok-free.dev` URL `ngrok` prints; both peers open that
+same URL and enter the same room code. On the free plan a tunnel session
+lasts about two hours and gets a new random URL each run. Never commit or
+share an authtoken in plain text.
+
+**Permanent — deploy to Render:**
+
+This repo includes `render.yaml`. In the
+[Render dashboard](https://dashboard.render.com), create a new Blueprint,
+point it at this repository, and Render provisions a free web service from
+that file, builds with `pip install -r requirements.txt`, and runs
+`uvicorn app.main:app --host 0.0.0.0 --port $PORT`. You get a permanent
+`https://pair-room-chat.onrender.com`-style URL with TLS and `wss://`
+handled for you — no expiring link, no local machine needing to stay on.
+
+`numInstances: 1` in `render.yaml` is required, not cosmetic: room state
+lives in process memory (see Extension boundary below), so a second
+instance would never see rooms created on the first. Render's free plan
+spins the service down after inactivity and takes a few seconds to wake on
+the next request.
+
+A shared URL (ngrok or Render) is reachable by anyone who has the link,
+same as any room code; don't post it publicly.
+
 ## Layout
 
 ```text
