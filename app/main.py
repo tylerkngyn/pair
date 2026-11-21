@@ -1,6 +1,7 @@
 """HTTP entry points and WebSocket protocol dispatch."""
 
 import asyncio
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -9,7 +10,9 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from pydantic import ValidationError
 
-from app.models import ChatEvent, JoinEvent, ReactionEvent, TypingEvent, client_event_adapter
+from app.models import (
+    ChatEvent, JoinEvent, PingEvent, ReactionEvent, TypingEvent, client_event_adapter,
+)
 from app.room_manager import RoomManager
 
 INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
@@ -18,6 +21,17 @@ MAX_FRAME_CHARS = 8192
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    redis_url = os.environ.get("REDIS_URL")
+    if redis_url:
+        from app.redis_room_manager import RedisRoomManager
+        manager = RedisRoomManager(redis_url)
+        await manager.start()
+        app.state.rooms = manager
+        try:
+            yield
+        finally:
+            await manager.stop()
+        return
     app.state.rooms = RoomManager()
     yield
 
@@ -73,7 +87,10 @@ async def websocket_endpoint(socket: WebSocket):
                 await manager.typing(peer, event.payload.typing)
             elif isinstance(event, ReactionEvent):
                 await manager.react(peer, event.payload.emoji)
-            # ping is deliberately one-way; the protocol has no pong event.
+            elif isinstance(event, PingEvent):
+                # One-way; the protocol has no pong event. Also refreshes
+                # Redis-side presence so a crashed worker's peers can be reaped.
+                await manager.heartbeat(peer)
     except (WebSocketDisconnect, OSError):
         pass
     except TimeoutError:

@@ -96,6 +96,9 @@ class RoomManager:
                 )))
                 return peer.room is not None
 
+    async def heartbeat(self, peer: Peer) -> None:
+        """No-op here; only RedisRoomManager needs a liveness signal to reap."""
+
     async def chat(self, peer: Peer, text: str) -> None:
         code = peer.room
         room = self._rooms.get(code) if code is not None else None
