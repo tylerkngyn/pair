@@ -1,6 +1,7 @@
 """HTTP entry points and WebSocket protocol dispatch."""
 
 import asyncio
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -18,6 +19,17 @@ MAX_FRAME_CHARS = 8192
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    redis_url = os.environ.get("REDIS_URL")
+    if redis_url:
+        from app.redis_room_manager import RedisRoomManager
+        manager = RedisRoomManager(redis_url)
+        await manager.start()
+        app.state.rooms = manager
+        try:
+            yield
+        finally:
+            await manager.stop()
+        return
     app.state.rooms = RoomManager()
     yield
 

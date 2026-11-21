@@ -158,15 +158,37 @@ python -m pytest -q
 
 ## Extension boundary
 
-Run **one Uvicorn worker**: all presence is in process memory and disappears on
-restart. In-memory WebSocket presence is process-local, as described in the
+By default, run **one Uvicorn worker**: all presence is in process memory and
+disappears on restart. In-memory WebSocket presence is process-local, as
+described in the
 [FastAPI WebSocket documentation](https://fastapi.tiangolo.com/advanced/websockets/).
 The protocol uses [Pydantic discriminated unions](https://docs.pydantic.dev/latest/concepts/unions/#discriminated-unions)
 so new lobby/game events can be added explicitly.
 
 To grow this MVP, add event schemas and dispatch handlers; keep membership and
-delivery behind `RoomManager`. A distributed Redis replacement will need atomic
-capacity/membership operations, expiring presence, and pub/sub to each worker's
-local sockets. WebSocket objects themselves cannot be put in Redis. No Redis or
-game/scoring behavior is included here. Room codes are sharing conveniences,
-not authentication or access control.
+delivery behind `RoomManager`. Room codes are sharing conveniences, not
+authentication or access control.
+
+### Running multiple workers (Redis-backed)
+
+Set `REDIS_URL` (e.g. `redis://localhost:6379/0`) and the app switches to
+`app/redis_room_manager.RedisRoomManager` instead of the in-process
+`RoomManager`. This makes it safe to run more than one Uvicorn
+worker/instance pointed at the same Redis:
+
+- **Membership** (who is in which room) lives in Redis, checked and updated
+  atomically by a Lua script, so capacity and duplicate-handle checks are
+  correct even when two workers race to join the same room.
+- **Delivery** happens over Redis Pub/Sub: a worker never has another
+  worker's actual `WebSocket` object, so instead it publishes every event to
+  a per-room channel, and each worker's own listener task forwards incoming
+  events only to the local sockets it holds.
+- A peer that disconnects is removed from Redis and the departure is
+  published so peers on *other* workers see it too.
+
+This is still MVP-grade: no message history, no auth beyond the room code,
+and a crashed worker's peers are not actively reaped (a production version
+would add presence TTLs/heartbeats). `tests/test_redis_room_manager.py`
+exercises this by running two `RedisRoomManager` instances against one
+shared [fakeredis](https://github.com/cunla/fakeredis-py) server to prove
+cross-worker join/chat/disconnect behavior without real multi-process infra.
