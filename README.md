@@ -82,14 +82,19 @@ app/
   room_manager.py  Room capacity, membership, ordered delivery, cleanup
 static/
   index.html       Complete responsive UI with inline CSS/JS
+  dashboard.html   Live /metrics + /health polling dashboard (GET /dashboard)
+scripts/
+  load_test.py     Concurrency/latency/throughput load test, see LOAD_TEST_RESULTS.md
+  kill_test.py     Worker-crash recovery-time test, see LOAD_TEST_RESULTS.md
 tests/
   test_chat.py     Protocol and lifecycle integration tests
 requirements.txt
 requirements-dev.txt
 ```
 
-`GET /` serves the UI; `GET /health` returns `{"status":"ok"}`; `WS /ws`
-handles the protocol. Routes do not manipulate room storage. A per-room lock
+`GET /` serves the UI; `GET /health` returns `{"status":"ok"}`; `GET /dashboard`
+serves a small live-metrics page; `WS /ws` handles the protocol. Routes do
+not manipulate room storage. A per-room lock
 serializes joins, chats, and departures; per-socket locks serialize delivery.
 Failed/slow sends are bounded, and failed peers are removed with departure
 notifications. Empty rooms are deleted. The browser retains at most 300 log
@@ -271,6 +276,39 @@ the rest of this app's design where only Redis room membership is actually
 shared state. If cluster-wide totals were ever needed, the natural
 follow-up is a small Redis-backed `INCR` per counter — not built now, since
 nothing currently needs it.
+
+`GET /dashboard` renders those same two endpoints (`/metrics` + `/health`)
+as a small auto-refreshing page instead of raw JSON — counters, a live event
+log for joins/reaps/sweeps, and a connectivity indicator. Same per-process
+scope as `/metrics` itself: it shows whichever worker answers that request,
+not a cluster total.
+
+### Load testing and crash recovery, with real numbers
+
+`scripts/load_test.py` and `scripts/kill_test.py` spin up real `uvicorn`
+worker processes against a real Dockerized Redis and drive them with real
+WebSocket clients (same pattern as the integration tests above, but as
+standalone CLIs rather than pytest tests, since a full run takes
+seconds-to-minutes). Full results, methodology, and reproduction commands
+are in [`LOAD_TEST_RESULTS.md`](./LOAD_TEST_RESULTS.md), including the test
+machine's specs — load generator and workers shared one laptop, so absolute
+throughput/latency numbers are directional, not a production ceiling.
+Headline findings from a run on 2026-11-23:
+
+- **1,000 concurrent clients (500 rooms) breaks a single worker** — most
+  pairs time out and the process stops answering `/health`; the *same*
+  1,000-client load runs clean on 2 workers, and 2,000 clients (which breaks
+  2 workers) runs clean on 4. That's the measured fact behind "horizontally
+  scalable," not just the Redis Pub/Sub design.
+- **Worker crash recovery takes ~100 seconds** with production defaults
+  (`SIGKILL` on one worker mid-session; the surviving peer's room returns to
+  `waiting` and is immediately rejoinable). That's a deliberate tradeoff, not
+  a slow implementation: dropping to a 20s TTL / 5s sweep cuts recovery to
+  ~25s, but 20s is shorter than the ~60s throttle browsers commonly apply to
+  backgrounded tabs' heartbeat, so it would start evicting peers who are
+  merely backgrounded, not crashed. Both numbers are measured — see
+  `scripts/kill_test.py --ttl`/`--reap-interval` and the "Why 100 seconds"
+  section of `LOAD_TEST_RESULTS.md`.
 
 ### Known gaps that are not closeable in this repo
 

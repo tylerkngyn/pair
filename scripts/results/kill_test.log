@@ -1,0 +1,14 @@
+Starting Redis container on port 49647...
+Starting worker A on 49651, worker B on 49652 (PRESENCE_TTL=90s, REAP_INTERVAL=20s)...
+Paired. Chat works:
+  Bob received: 'hello before kill' from Alice
+
+SIGKILL-ing worker A (pid 23103, port 49651) mid-session...
+Waiting for Bob (on surviving worker B) to see Alice leave...
+  system: 'Alice left the room'  ->  100.0s after kill -9
+  room_state back to waiting, peers=['Bob']  ->  100.0s after kill -9
+
+Room still usable: Bob can be rejoined by a new peer.
+  Carol joined and re-paired with Bob successfully.
+
+RESULT: detect=100.0s  full_recovery=100.0s  (TTL=90s, reap interval=20s)
