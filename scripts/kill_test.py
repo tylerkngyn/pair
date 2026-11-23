@@ -11,11 +11,20 @@ real production PRESENCE_TTL_SECONDS/REAP_INTERVAL_SECONDS defaults, so the
 recovery time it reports is the real one, not an accelerated test value.
 
 Usage:
-    python scripts/kill_test.py
+    python scripts/kill_test.py                               # production defaults: TTL=90s, reap=20s
+    python scripts/kill_test.py --ttl 20 --reap-interval 5     # short-TTL tradeoff comparison
+
+A shorter TTL/reap-interval detects a real crash faster, at the cost of
+false-positive evictions against a merely backgrounded/throttled browser
+tab (browsers commonly throttle backgrounded setInterval to ~60s — see the
+README) — this script only measures the "detects a real crash faster" half
+of that tradeoff; it does not simulate a backgrounded-but-alive tab.
 """
 
+import argparse
 import asyncio
 import json
+import os
 import shutil
 import socket as socketlib
 import subprocess
@@ -124,6 +133,11 @@ async def scenario(port_a, port_b, proc_a):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ttl", type=int, default=90, help="PAIR_PRESENCE_TTL_SECONDS (production default: 90)")
+    parser.add_argument("--reap-interval", type=int, default=20, help="PAIR_REAP_INTERVAL_SECONDS (production default: 20)")
+    args = parser.parse_args()
+
     if not shutil.which("docker"):
         raise SystemExit("Docker required for this test")
 
@@ -137,10 +151,15 @@ def main():
     redis_url = f"redis://127.0.0.1:{redis_port}/0"
     wait_for(lambda: redis_reachable(redis_url), 15, "redis ready")
 
-    import os
-    env = {**os.environ, "REDIS_URL": redis_url}
+    env = {
+        **os.environ,
+        "REDIS_URL": redis_url,
+        "PAIR_PRESENCE_TTL_SECONDS": str(args.ttl),
+        "PAIR_REAP_INTERVAL_SECONDS": str(args.reap_interval),
+    }
     port_a, port_b = free_port(), free_port()
-    print(f"Starting worker A on {port_a}, worker B on {port_b} (production PRESENCE_TTL/REAP_INTERVAL defaults)...")
+    print(f"Starting worker A on {port_a}, worker B on {port_b} "
+          f"(PRESENCE_TTL={args.ttl}s, REAP_INTERVAL={args.reap_interval}s)...")
     proc_a = subprocess.Popen(
         ["python", "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", str(port_a)],
         cwd=REPO_ROOT, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -154,7 +173,8 @@ def main():
         wait_for(lambda: http_ok(f"http://127.0.0.1:{port_b}/health"), 10, "worker B healthy")
 
         detect_s, recover_s = asyncio.run(scenario(port_a, port_b, proc_a))
-        print(f"\nRESULT: detect={detect_s:.1f}s  full_recovery={recover_s:.1f}s  (production TTL=90s, reap interval=20s)")
+        print(f"\nRESULT: detect={detect_s:.1f}s  full_recovery={recover_s:.1f}s  "
+              f"(TTL={args.ttl}s, reap interval={args.reap_interval}s)")
     finally:
         for proc in (proc_a, proc_b):
             if proc.poll() is None:

@@ -2,10 +2,26 @@
 
 Real numbers from `scripts/load_test.py` and `scripts/kill_test.py` — real
 `uvicorn` worker processes, a real Dockerized `redis:7-alpine`, real
-WebSocket clients, driven from one laptop (Apple Silicon Mac, local Docker
-Desktop) on 2026-11-23. Not a production benchmark on production hardware —
-treat absolute numbers as directional, the *shape* (1 worker caps out, 2 and
-4 workers don't, at the same offered load) as the fact this exists to prove.
+WebSocket clients, run on 2026-11-23. Not a production benchmark on
+production hardware — treat absolute numbers as directional, the *shape*
+(1 worker caps out, 2 and 4 workers don't, at the same offered load) as the
+fact this exists to prove.
+
+## Test environment
+
+- MacBook Pro, Apple M3 Pro (11 cores: 5 performance + 6 efficiency), 18 GB RAM
+- macOS 15.7.9, Python 3.13.11, Docker 29.7.2 (Docker Desktop)
+- **The load generator and all app workers ran on this same machine**, sharing
+  its CPU/RAM/network stack with each other and with Docker Desktop's own VM.
+  That's a real confound: under load, the Python asyncio client driving
+  hundreds of WebSocket connections competes for the same cores as the
+  uvicorn worker(s) it's measuring, and all inter-process traffic (including
+  "network" hops to Redis) is loopback, not a real network. Absolute latency
+  and throughput numbers are this-machine-under-this-contention numbers, not
+  a production ceiling — the load-bearing fact is the *relative* one (adding
+  workers measurably moves the breaking point), not the absolute throughput.
+  A real capacity benchmark would run the client and each worker on separate
+  machines.
 
 Raw JSON for every run is in `scripts/results/`.
 
@@ -75,23 +91,63 @@ Room still usable: Carol joined and re-paired with Bob successfully.
 RESULT: detect=100.0s  full_recovery=100.0s
 ```
 
-**Result: 100 seconds to full recovery**, close to the README's documented
-worst case (`PRESENCE_TTL_SECONDS` + `REAP_INTERVAL_SECONDS` = 110s — Alice's
-presence key had already been live a few seconds before the kill, so the
-margin is in the right ballpark, not an exact match). Worker B's own reap sweep — not worker A, which is dead — notices
-Alice's expired presence key, removes her from Redis, publishes the
-departure so Bob's room goes back to `waiting`, and the room is immediately
-rejoinable by a new peer. No manual intervention, no stuck room, no zombie
-peer.
+**Result: 100 seconds to full recovery.** Worker B's own reap sweep — not
+worker A, which is dead — notices Alice's expired presence key, removes her
+from Redis, publishes the departure so Bob's room goes back to `waiting`,
+and the room is immediately rejoinable by a new peer. No manual
+intervention, no stuck room, no zombie peer. (Why exactly 100s, not the
+README's theoretical 110s ceiling, is explained below.)
 
-That number is a direct, tunable trade-off: lowering
-`PRESENCE_TTL_SECONDS`/`REAP_INTERVAL_SECONDS` detects crashes faster at the
-cost of false-positives against a merely backgrounded/throttled browser tab
-(see the README's note on `setInterval` throttling) — the current defaults
-were chosen to absorb that, not for speed.
+### Why 100 seconds, and the tradeoff against going faster
 
-Reproduce: `python scripts/kill_test.py` (takes ~110s — it waits out the
-real timers, not an accelerated test double).
+100s isn't an accident of the test, it's close to this app's own stated
+worst case (`PRESENCE_TTL_SECONDS` + `REAP_INTERVAL_SECONDS` = 90 + 20 =
+110s) — and the typical case actually lands a bit under that ceiling.
+Alice's presence key starts its 90s countdown the moment she joins, and the
+sweep that notices it has expired lands somewhere in its next 20s cycle, not
+necessarily at the full 20s mark — so the expected detection time is closer
+to `TTL + reap_interval/2` (≈100s) than the strict `TTL + reap_interval`
+upper bound (110s). That matches what was measured.
+
+**That 90s/20s choice is a direct, tunable tradeoff, not an oversight.**
+A shorter TTL detects a real crash faster — but the TTL isn't free-floating,
+it's refreshed by the same browser `ping` heartbeat that keeps a tab alive,
+and browsers throttle backgrounded tabs' `setInterval` to roughly once a
+minute (see the README). A TTL shorter than that throttled interval would
+start evicting peers who are still connected and still coming back, just on
+a backgrounded tab — a false eviction, not a crash. 90s was chosen
+specifically to comfortably outlive that throttling; it's slow by design,
+not by neglect.
+
+To make that tradeoff concrete, `scripts/kill_test.py` now accepts
+`--ttl`/`--reap-interval` overrides (wired to the same
+`PAIR_PRESENCE_TTL_SECONDS`/`PAIR_REAP_INTERVAL_SECONDS` env vars the app
+already reads) so the faster-but-riskier end of that tradeoff is a measured
+number too, not just a claim:
+
+| TTL | Reap interval | Measured recovery | Worst-case ceiling (TTL + interval) |
+|---|---|---|---|
+| 90s (production default) | 20s | **100.0s** | 110s |
+| 20s | 5s | **24.8s** | 25s |
+
+Dropping to a 20s TTL / 5s sweep cuts recovery from 100s to ~25s — a real,
+4x improvement in crash-detection speed — but at a cost this test doesn't
+measure directly: a 20s TTL is *shorter* than the ~60s throttle interval
+browsers commonly apply to backgrounded tabs, so in production that setting
+would start reaping peers who are merely backgrounded, not crashed, turning
+"fast recovery" into "spurious disconnects." The 90s/20s production default
+exists specifically to stay above that throttling floor; the 20s/5s number
+above is what you'd get if you *didn't* need to protect against backgrounded
+tabs — e.g. a server-to-server presence check with its own dedicated
+heartbeat — not a drop-in replacement for this app's current default.
+
+Reproduce:
+```sh
+python scripts/kill_test.py                           # production: TTL=90s, reap=20s -> ~100s
+python scripts/kill_test.py --ttl 20 --reap-interval 5 # faster, riskier -> ~25s
+```
+Each run takes roughly its own worst-case ceiling in wall-clock time — it
+waits out the real timers, not an accelerated test double.
 
 ## Dashboard
 

@@ -290,8 +290,10 @@ worker processes against a real Dockerized Redis and drive them with real
 WebSocket clients (same pattern as the integration tests above, but as
 standalone CLIs rather than pytest tests, since a full run takes
 seconds-to-minutes). Full results, methodology, and reproduction commands
-are in [`LOAD_TEST_RESULTS.md`](./LOAD_TEST_RESULTS.md). Headline findings
-from a run on 2026-11-23:
+are in [`LOAD_TEST_RESULTS.md`](./LOAD_TEST_RESULTS.md), including the test
+machine's specs — load generator and workers shared one laptop, so absolute
+throughput/latency numbers are directional, not a production ceiling.
+Headline findings from a run on 2026-11-23:
 
 - **1,000 concurrent clients (500 rooms) breaks a single worker** — most
   pairs time out and the process stops answering `/health`; the *same*
@@ -300,8 +302,13 @@ from a run on 2026-11-23:
   scalable," not just the Redis Pub/Sub design.
 - **Worker crash recovery takes ~100 seconds** with production defaults
   (`SIGKILL` on one worker mid-session; the surviving peer's room returns to
-  `waiting` and is immediately rejoinable), matching the documented
-  `PRESENCE_TTL_SECONDS` + `REAP_INTERVAL_SECONDS` worst case almost exactly.
+  `waiting` and is immediately rejoinable). That's a deliberate tradeoff, not
+  a slow implementation: dropping to a 20s TTL / 5s sweep cuts recovery to
+  ~25s, but 20s is shorter than the ~60s throttle browsers commonly apply to
+  backgrounded tabs' heartbeat, so it would start evicting peers who are
+  merely backgrounded, not crashed. Both numbers are measured — see
+  `scripts/kill_test.py --ttl`/`--reap-interval` and the "Why 100 seconds"
+  section of `LOAD_TEST_RESULTS.md`.
 
 ### Known gaps that are not closeable in this repo
 
