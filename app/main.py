@@ -16,6 +16,7 @@ from app.models import (
 from app.room_manager import RoomManager
 
 INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
+DASHBOARD = Path(__file__).resolve().parent.parent / "static" / "dashboard.html"
 MAX_FRAME_CHARS = 8192
 
 
@@ -52,6 +53,11 @@ async def health():
 @app.get("/metrics")
 async def metrics():
     return app.state.rooms.metrics.as_dict()
+
+
+@app.get("/dashboard", response_class=FileResponse)
+async def dashboard():
+    return FileResponse(DASHBOARD)
 
 
 @app.websocket("/ws")

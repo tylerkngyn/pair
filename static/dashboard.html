@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Pair — metrics dashboard</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, system-ui, sans-serif; margin: 0; padding: 24px; background: #0b0d10; color: #e7e9ea; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color: #9aa1a9; font-size: 13px; margin-bottom: 20px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .card { background: #14171a; border: 1px solid #23272b; border-radius: 10px; padding: 14px 16px; }
+  .card .label { font-size: 12px; color: #9aa1a9; text-transform: uppercase; letter-spacing: 0.04em; }
+  .card .value { font-size: 28px; font-weight: 600; margin-top: 4px; }
+  .status-ok { color: #4ade80; }
+  .status-bad { color: #f87171; }
+  #log { background: #14171a; border: 1px solid #23272b; border-radius: 10px; padding: 12px 14px; height: 220px; overflow-y: auto; font-family: ui-monospace, Menlo, monospace; font-size: 12.5px; white-space: pre-wrap; }
+  #log div { padding: 1px 0; border-bottom: 1px solid #1c2024; }
+  .note { font-size: 12px; color: #6b7280; margin-top: 16px; }
+</style>
+</head>
+<body>
+  <h1>Pair — live metrics <span id="health" class="status-bad">●</span></h1>
+  <div class="sub">
+    Polling <code>GET /metrics</code> and <code>GET /health</code> on <b id="origin"></b> every 2s.
+    Counters are per-process — this page shows whichever worker answers this origin, not a cluster-wide total.
+  </div>
+
+  <div class="grid">
+    <div class="card"><div class="label">Rooms active</div><div class="value" id="rooms_active">—</div></div>
+    <div class="card"><div class="label">Peers connected (total)</div><div class="value" id="peers_connected_total">—</div></div>
+    <div class="card"><div class="label">Reap sweeps (total)</div><div class="value" id="reap_sweeps_total">—</div></div>
+    <div class="card"><div class="label">Peers reaped (total)</div><div class="value" id="peers_reaped_total">—</div></div>
+  </div>
+
+  <div id="log"></div>
+  <div class="note">
+    This is intentionally a plain polling page, not a metrics backend — see the README's
+    "Observability" section for why (no Prometheus here, deliberately). Refresh the page
+    after a worker restart; it does not persist history across reloads.
+  </div>
+
+<script>
+  const els = {
+    rooms_active: document.getElementById("rooms_active"),
+    peers_connected_total: document.getElementById("peers_connected_total"),
+    reap_sweeps_total: document.getElementById("reap_sweeps_total"),
+    peers_reaped_total: document.getElementById("peers_reaped_total"),
+    health: document.getElementById("health"),
+    log: document.getElementById("log"),
+    origin: document.getElementById("origin"),
+  };
+  els.origin.textContent = window.location.origin;
+
+  let last = null;
+
+  function logLine(text) {
+    const div = document.createElement("div");
+    const ts = new Date().toLocaleTimeString();
+    div.textContent = `[${ts}] ${text}`;
+    els.log.prepend(div);
+    while (els.log.childElementCount > 200) els.log.removeChild(els.log.lastChild);
+  }
+
+  async function poll() {
+    try {
+      const [healthRes, metricsRes] = await Promise.all([
+        fetch("/health", { cache: "no-store" }),
+        fetch("/metrics", { cache: "no-store" }),
+      ]);
+      const healthy = healthRes.ok;
+      const metrics = await metricsRes.json();
+
+      els.health.className = healthy ? "status-ok" : "status-bad";
+      for (const key of Object.keys(els)) {
+        if (key in metrics) els[key].textContent = metrics[key];
+      }
+
+      if (last) {
+        if (metrics.peers_connected_total > last.peers_connected_total) {
+          logLine(`+${metrics.peers_connected_total - last.peers_connected_total} peer(s) joined`);
+        }
+        if (metrics.peers_reaped_total > last.peers_reaped_total) {
+          logLine(`+${metrics.peers_reaped_total - last.peers_reaped_total} peer(s) reaped (crash recovery)`);
+        }
+        if (metrics.reap_sweeps_total > last.reap_sweeps_total) {
+          logLine(`reap sweep ran (${metrics.reap_sweeps_total} total)`);
+        }
+      } else {
+        logLine("connected");
+      }
+      last = metrics;
+    } catch (err) {
+      els.health.className = "status-bad";
+      logLine(`poll failed: ${err}`);
+    }
+  }
+
+  poll();
+  setInterval(poll, 2000);
+</script>
+</body>
+</html>
