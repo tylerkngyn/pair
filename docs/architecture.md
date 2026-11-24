@@ -173,7 +173,7 @@ Deviation from the original draft: a synchronous match returns only `match_id`, 
 
 `DELETE /api/ranked/queue` — no body. `200` `{"status": "left"}`, `404` if not queued, or `409` `{"detail": "Already matched"}` if a match was found before the cancel was processed.
 
-`GET /api/ranked/queue` — **new, not in the original draft.** Added because Phase 1 has no per-account WebSocket delivery yet (see "WebSocket" below), so a side that was already queued when the opponent's `POST` matched them has no other way to learn about it. Polling-based, consumes the pending-match notice on read:
+`GET /api/ranked/queue` — **new, not in the original draft.** Started as a fallback for when WebSocket delivery can't be confirmed (see "WebSocket" below) — consumes the pending-match notice on read. It now also does real work beyond that: if the polling account is still queued, it opportunistically retries matching against the whole queue with its own wait-widened window (`app/practice/ranked_routes.py`'s `_find_opponent`, same widening math `POST /api/ranked/queue` uses). This matters because matching otherwise only ever runs inside *another* account's `POST` — a lone queued player's own window would never widen just from waiting, since nothing re-checks it. The client already polls this endpoint regularly for the MATCH_FOUND fallback, so this piggybacks on that instead of needing a separate background task.
 
 ```json
 {"status": "idle"}
@@ -188,6 +188,8 @@ Deviation from the original draft: a synchronous match returns only `match_id`, 
 ```
 
 `tier` is computed server-side from `rating` at response time (400-point bands, floor `100`) so the client never re-implements the tier boundaries; it is never stored. Band edges: Bronze `100–499`, Silver `500–899`, Gold `900–1299`, Diamond `1300+`.
+
+`outcome` (both here and in the match/history/WS payloads below) is one of `win`/`loss`/`draw`/`abandoned` — `abandoned` marks a loss caused specifically by never submitting anything in the match, so it's distinguishable from a `loss` earned by trying and losing on correctness or time. If one side never submits, it's `abandoned` and the other side `win`s regardless of the other's correctness (showing up and failing beats not showing up). If *neither* side ever submits, both get `abandoned` — not a draw, since a draw would cost an abandoning account nothing and the Obsidian plan requires abandonment to cost rating. There's no winner to run through the normal zero-sum Elo update in that case, so each side is scored independently as a loss against an opponent of its own rating (same shape as a chess resignation, −K/2 each).
 
 `GET /api/ranked/matches/{match_id}` — **new.** Match detail for either participant; also the only place finalization is checked (see below). `404` for a match the caller isn't a participant in.
 

@@ -113,6 +113,59 @@ def _create_match(db, waiting: dict, incoming: dict) -> RankedMatch:
     return match
 
 
+def _find_opponent(incoming: dict):
+    """Window widens with however long either side has waited, not just the
+    candidate's own wait — a fresh arrival can still immediately match a
+    long-waiting candidate (existing behavior), and a long-waiting poller
+    re-scanning the queue (see queue_status below) gets the same courtesy
+    even against a candidate who just arrived.
+    """
+    return next((
+        candidate for candidate in _QUEUE
+        if candidate["user_id"] != incoming["user_id"]
+        and candidate["filters"] == incoming["filters"]
+        and abs(candidate["rating"] - incoming["rating"]) <= _widen(time.time() - max(candidate["queued_at"], incoming["queued_at"]))
+    ), None)
+
+
+async def _match_and_push(request: Request, waiting: dict, incoming: dict, db):
+    """Creates the match (caller holds _LOCK and an open transaction on
+    `db`) and returns the info needed to push MATCH_FOUND once that
+    transaction has committed and the lock is released.
+
+    Removes both sides from _QUEUE by identity, not equality — `incoming`
+    is sometimes a brand-new entry that was never queued (join_queue's own
+    arrival) and sometimes an already-queued entry re-matching on a poll
+    (queue_status), so both sides need an unconditional, identity-based
+    removal rather than assuming only one of them is actually in _QUEUE.
+    """
+    _QUEUE[:] = [e for e in _QUEUE if e is not waiting and e is not incoming]
+    match = _create_match(db, waiting, incoming)
+    _PENDING_MATCH[waiting["user_id"]] = match.id
+    _PENDING_MATCH[incoming["user_id"]] = match.id
+    return {
+        "match_id": match.id, "deadline": match.deadline,
+        "problems": [MatchFoundProblem(id=pid, title=PROBLEMS[pid]["title"]) for pid in match.problem_ids],
+    }
+
+
+async def _push_match_found(request: Request, match_info: dict, a: dict, b: dict):
+    # Pushed outside both the lock and the transaction: a dropped/slow
+    # delivery should never hold either. _PENDING_MATCH is purely the
+    # GET /api/ranked/queue poll fallback's mailbox at this point (the DB
+    # is what guards against re-queueing, via _has_active_match above), so
+    # a *confirmed* local delivery can safely drop it right away instead of
+    # leaving a stale notification for a poll that will never need it.
+    for side, opponent in ((a, b), (b, a)):
+        delivered = await request.app.state.rooms.send_to_user(side["user_id"], MatchFoundEvent(payload=MatchFoundPayload(
+            match_id=match_info["match_id"], opponent=opponent["username"], opponent_rating=opponent["rating"],
+            deadline=match_info["deadline"], problems=match_info["problems"],
+        )))
+        if delivered:
+            with _LOCK:
+                _PENDING_MATCH.pop(side["user_id"], None)
+
+
 @router.post("/queue", status_code=202)
 async def join_queue(filters: QueueFilters, request: Request, identity=Depends(auth.authenticated_write)):
     user = identity[0]
@@ -130,36 +183,12 @@ async def join_queue(filters: QueueFilters, request: Request, identity=Depends(a
                 "user_id": user.id, "username": user.username, "rating": rating_row.rating,
                 "filters": filters.model_dump(), "queued_at": time.time(),
             }
-            opponent_entry = next((
-                candidate for candidate in _QUEUE
-                if candidate["filters"] == incoming["filters"]
-                and abs(candidate["rating"] - incoming["rating"]) <= _widen(time.time() - candidate["queued_at"])
-            ), None)
+            opponent_entry = _find_opponent(incoming)
             if opponent_entry is None:
                 _QUEUE.append(incoming)
                 return {"status": "queued", "queued_at": incoming["queued_at"]}
-            _QUEUE.remove(opponent_entry)
-            match = _create_match(db, opponent_entry, incoming)
-            _PENDING_MATCH[opponent_entry["user_id"]] = match.id
-            _PENDING_MATCH[user.id] = match.id
-            match_info = {
-                "match_id": match.id, "deadline": match.deadline,
-                "problems": [MatchFoundProblem(id=pid, title=PROBLEMS[pid]["title"]) for pid in match.problem_ids],
-            }
-    # Pushed outside both the lock and the transaction: a dropped/slow
-    # delivery should never hold either. _PENDING_MATCH is purely the
-    # GET /api/ranked/queue poll fallback's mailbox at this point (the DB
-    # is what guards against re-queueing, via _has_active_match above), so
-    # a *confirmed* local delivery can safely drop it right away instead of
-    # leaving a stale notification for a poll that will never need it.
-    for side, opponent in ((incoming, opponent_entry), (opponent_entry, incoming)):
-        delivered = await request.app.state.rooms.send_to_user(side["user_id"], MatchFoundEvent(payload=MatchFoundPayload(
-            match_id=match_info["match_id"], opponent=opponent["username"], opponent_rating=opponent["rating"],
-            deadline=match_info["deadline"], problems=match_info["problems"],
-        )))
-        if delivered:
-            with _LOCK:
-                _PENDING_MATCH.pop(side["user_id"], None)
+            match_info = await _match_and_push(request, opponent_entry, incoming, db)
+    await _push_match_found(request, match_info, incoming, opponent_entry)
     return {"status": "matched", "match_id": match_info["match_id"]}
 
 
@@ -178,15 +207,31 @@ def leave_queue(request: Request, identity=Depends(auth.authenticated_write)):
 
 
 @router.get("/queue")
-def queue_status(identity=Depends(auth.current_login)):
+async def queue_status(request: Request, identity=Depends(auth.current_login)):
     user_id = identity[0].id
+    match_info = None
+    mine = None
+    opponent_entry = None
     with _LOCK:
         match_id = _PENDING_MATCH.pop(user_id, None)
         if match_id:
             return {"status": "matched", "match_id": match_id}
-        if any(e["user_id"] == user_id for e in _QUEUE):
+        mine = next((e for e in _QUEUE if e["user_id"] == user_id), None)
+        if mine is None:
+            return {"status": "idle"}
+        # Opportunistic widening: matching otherwise only runs inside
+        # another account's POST /api/ranked/queue, so a lone queued player
+        # would never benefit from their own window growing while they
+        # just sit there. The client already polls this endpoint every few
+        # seconds anyway (as the MATCH_FOUND poll fallback), so piggybacking
+        # the retry here needs no new background task.
+        opponent_entry = _find_opponent(mine)
+        if opponent_entry is None:
             return {"status": "queued"}
-        return {"status": "idle"}
+        with request.app.state.database.session.begin() as db:
+            match_info = await _match_and_push(request, opponent_entry, mine, db)
+    await _push_match_found(request, match_info, mine, opponent_entry)
+    return {"status": "matched", "match_id": match_info["match_id"]}
 
 
 @router.get("/rating")
@@ -225,22 +270,39 @@ def _finalize_if_ready(db, match: RankedMatch):
         statuses, correctness = _problem_statuses_and_correctness(db, match, participant.user_id)
         work = list(db.scalars(select(RankedWork).where(RankedWork.match_id == match.id, RankedWork.user_id == participant.user_id)))
         last_submit = max((w.result["submitted_at"] for w in work if w.result), default=match.deadline)
-        work_by_user[participant.user_id] = {"correctness": correctness, "elapsed": last_submit - match.started_at}
+        attempted = any(status != "not_started" for status in statuses.values())
+        work_by_user[participant.user_id] = {"correctness": correctness, "elapsed": last_submit - match.started_at, "attempted": attempted}
     now = time.time()
     # A match finalizes once the deadline has passed. (Early "both sides
     # confirmed ready" finalization is deferred past Phase 1.)
     if now <= match.deadline:
         return None
     a, b = participants
-    outcome_a, score_a = match_outcome(
-        work_by_user[a.user_id]["correctness"], work_by_user[b.user_id]["correctness"],
-        work_by_user[a.user_id]["elapsed"], work_by_user[b.user_id]["elapsed"],
-    )
-    new_a, new_b = elo_update(a.rating_before, b.rating_before, 0, 0, score_a)
+    a_info, b_info = work_by_user[a.user_id], work_by_user[b.user_id]
+    if not a_info["attempted"] and not b_info["attempted"]:
+        # Double no-show: neither side ever submitted anything. Not a draw
+        # — the plan says abandoning is a loss for the abandoning side, and
+        # with no one left to call a winner there's no zero-sum pair to run
+        # through elo_update. Each side instead takes the penalty it would
+        # get for losing to an opponent of its own rating (-K/2, same shape
+        # as a chess resignation), independently.
+        outcome_a = outcome_b = "abandoned"
+        new_a, _ = elo_update(a.rating_before, a.rating_before, 0, 0, 0.0)
+        new_b, _ = elo_update(b.rating_before, b.rating_before, 0, 0, 0.0)
+    elif not a_info["attempted"]:
+        outcome_a, outcome_b = "abandoned", "win"
+        new_a, new_b = elo_update(a.rating_before, b.rating_before, 0, 0, 0.0)
+    elif not b_info["attempted"]:
+        outcome_a, outcome_b = "win", "abandoned"
+        new_a, new_b = elo_update(a.rating_before, b.rating_before, 0, 0, 1.0)
+    else:
+        outcome_a, score_a = match_outcome(a_info["correctness"], b_info["correctness"], a_info["elapsed"], b_info["elapsed"])
+        outcome_b = {"win": "loss", "loss": "win", "draw": "draw"}[outcome_a]
+        new_a, new_b = elo_update(a.rating_before, b.rating_before, 0, 0, score_a)
     results = {}
     for participant, opponent, outcome, new_rating, opponent_new_rating in (
         (a, b, outcome_a, new_a, new_b),
-        (b, a, {"win": "loss", "loss": "win", "draw": "draw"}[outcome_a], new_b, new_a),
+        (b, a, outcome_b, new_b, new_a),
     ):
         participant.outcome = outcome
         participant.rating_after = new_rating

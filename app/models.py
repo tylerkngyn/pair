@@ -178,7 +178,10 @@ class OpponentProgressEvent(StrictModel):
 
 
 class MatchResultPayload(StrictModel):
-    outcome: Literal["win", "loss", "draw"]
+    # "abandoned" marks a loss specifically caused by never submitting
+    # anything, distinct from a "loss" earned by trying and losing on
+    # correctness/time — see the Obsidian plan's abandonment-as-loss rule.
+    outcome: Literal["win", "loss", "draw", "abandoned"]
     my_correctness: float
     opponent_correctness: float
     rating_before: int

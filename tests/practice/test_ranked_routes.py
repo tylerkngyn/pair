@@ -211,6 +211,10 @@ def test_opponent_progress_and_match_result_pushed_over_websocket(client, monkey
             problem_id = client.get(f"/api/ranked/matches/{match_id}").json()["problems"][0]["id"]
             total = len(PROBLEMS[problem_id]["cases"])
 
+            as_(client, alice)
+            _submit(client, alice, match_id, problem_id, 0, total)
+            bob_ws.receive_json()  # opponent_progress for bob, not asserted here
+
             as_(client, bob)
             _submit(client, bob, match_id, problem_id, total, total)
             progress = alice_ws.receive_json()
@@ -233,3 +237,83 @@ def test_opponent_progress_and_match_result_pushed_over_websocket(client, monkey
             bob_result = bob_ws.receive_json()
             assert bob_result["type"] == "match_result"
             assert bob_result["payload"]["outcome"] == "win"
+
+
+def test_one_sided_abandonment_is_a_loss_not_a_draw(client, monkeypatch):
+    """Alice never submits anything; bob does. Alice's zero correctness
+    already made this resolve as a loss before abandonment tracking
+    existed, so this mostly pins down the outcome label itself.
+    """
+    monkeypatch.setattr(ranked_routes, "SUBMISSION_PLAUSIBILITY_FLOOR_SECONDS", 0)
+    from app.practice.catalog import PROBLEMS
+    alice, bob, match_id = _match_two_players(client)
+    problem_id = client.get(f"/api/ranked/matches/{match_id}").json()["problems"][0]["id"]
+    total = len(PROBLEMS[problem_id]["cases"])
+
+    _submit(client, bob, match_id, problem_id, total, total)
+    # alice never submits anything at all.
+
+    with client.app.state.database.session.begin() as db:
+        db.get(ranked_routes.RankedMatch, match_id).deadline = time.time() - 1
+
+    as_(client, alice)
+    result = client.get(f"/api/ranked/matches/{match_id}").json()
+    assert result["my_outcome"] == "abandoned"
+    assert result["opponent_outcome"] == "win"
+    assert result["my_rating_after"] < 1000
+    assert result["opponent_rating_after"] > 1000
+
+
+def test_double_abandonment_is_a_loss_for_both_not_a_draw(client):
+    """Neither side ever submits. Before the abandonment fix, equal
+    correctness (0) and equal elapsed time (both default to the deadline)
+    made this resolve as a draw with no rating change — exactly what the
+    Obsidian plan's anti-cheat section says must not happen, since a draw
+    costs an abandoning account nothing.
+    """
+    alice, bob, match_id = _match_two_players(client)
+
+    with client.app.state.database.session.begin() as db:
+        db.get(ranked_routes.RankedMatch, match_id).deadline = time.time() - 1
+
+    as_(client, alice)
+    alice_result = client.get(f"/api/ranked/matches/{match_id}").json()
+    assert alice_result["my_outcome"] == "abandoned"
+    assert alice_result["my_rating_after"] < 1000
+
+    as_(client, bob)
+    bob_result = client.get(f"/api/ranked/matches/{match_id}").json()
+    assert bob_result["my_outcome"] == "abandoned"
+    assert bob_result["my_rating_after"] < 1000
+
+
+def test_queue_widens_and_matches_on_poll_not_just_on_arrival(client):
+    """A lone queued player's own window must still widen over the wait,
+    not only when someone else's POST happens to arrive — GET /queue is
+    the mechanism that gives them that chance, since it's already polled
+    regularly as the MATCH_FOUND fallback. Before this fix, polling never
+    attempted a match at all, so this would have stayed "queued" forever.
+    """
+    alice = register(client, "alice")
+    as_(client, alice)
+    client.post("/api/ranked/queue", json=FILTERS)
+    # Pushes alice's queue entry's rating outside bob's default initial
+    # ±50 window, so the two can't match on bob's own arrival below.
+    ranked_routes._QUEUE[0]["rating"] = 1200
+
+    bob = register(client, "bob")
+    as_(client, bob)
+    assert client.post("/api/ranked/queue", json=FILTERS).json()["status"] == "queued"
+
+    # Simulate both having waited long enough for the window to have
+    # widened past the 200-point gap (_widen(100s) == 400).
+    for entry in ranked_routes._QUEUE:
+        entry["queued_at"] -= 100
+
+    as_(client, alice)
+    polled = client.get("/api/ranked/queue")
+    assert polled.json()["status"] == "matched"
+    match_id = polled.json()["match_id"]
+
+    as_(client, bob)
+    assert client.get("/api/ranked/queue").json() == {"status": "matched", "match_id": match_id}
