@@ -105,15 +105,16 @@ function log(text, cls) {
 
 async function api(path, options = {}) {
   const headers = { ...(options.body ? {'Content-Type': 'application/json'} : {}), ...(csrf ? {'X-CSRF-Token': csrf} : {}), ...options.headers };
+  const sent = options.body ? ` body=${options.body}` : '';
   const response = await fetch(`/api${path}`, { ...options, headers, credentials: 'same-origin' });
   let body = null;
   try { body = await response.json(); } catch {}
   if (!response.ok) {
     const detail = typeof body?.detail === 'string' ? body.detail : JSON.stringify(body?.detail ?? body);
-    log(`${options.method || 'GET'} ${path} -> ${response.status}: ${detail}`, 'err');
+    log(`${options.method || 'GET'} ${path}${sent} -> ${response.status}: ${detail}`, 'err');
     throw new Error(detail);
   }
-  log(`${options.method || 'GET'} ${path} -> ${response.status}: ${JSON.stringify(body)}`, 'ok');
+  log(`${options.method || 'GET'} ${path}${sent} -> ${response.status}: ${JSON.stringify(body)}`, 'ok');
   return body;
 }
 
