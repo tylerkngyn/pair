@@ -14,7 +14,9 @@
   button { cursor: pointer; }
   button:hover { background:#292929; }
   button:disabled { opacity:.4; cursor:not-allowed; }
-  textarea { width: 100%; height: 90px; }
+  textarea { width: 100%; height: 320px; font-size: 14px; line-height: 1.5; resize: vertical; }
+  .hint { color:#9a9a9a; font-size: 12px; margin: 4px 0 10px; }
+  #problem-picker button.selected { outline: 2px solid #8aa9d0; }
   .row { display:flex; gap:12px; flex-wrap: wrap; align-items:flex-end; }
   .row > div { flex: 1; min-width: 120px; }
   pre { background:#111; padding:8px; border-radius:4px; overflow:auto; max-height:260px; white-space:pre-wrap; word-break:break-all; }
@@ -67,11 +69,12 @@
 
 <section>
   <h2>Match <span id="match-id" class="pill"></span></h2>
+  <p class="hint">1. Click <b>Refresh match</b> to load the problem(s). 2. Click a problem button below to select it — nothing is submittable until one is highlighted. 3. Submit below.</p>
   <div class="row">
     <div><button id="match-get">Refresh match</button></div>
   </div>
-  <div id="problem-picker"></div>
-  <label>Code</label>
+  <div id="problem-picker" style="margin: 10px 0;"></div>
+  <label id="selected-label">Code (no problem selected yet)</label>
   <textarea id="code">def solve():
     pass</textarea>
   <div class="row" style="margin-top:8px">
@@ -94,7 +97,8 @@
 'use strict';
 const $ = id => document.getElementById(id);
 let csrf = null, username = null, ws = null;
-let currentMatchId = null, currentProblemId = null, currentRevision = 0;
+let currentMatchId = null, currentProblemId = null;
+const revisions = {}; // problem_id -> revision, since each problem in a match tracks its own independently
 
 function log(text, cls) {
   const line = document.createElement('div');
@@ -161,16 +165,27 @@ $('queue-leave').onclick = () => api('/ranked/queue', {method: 'DELETE'}).catch(
 $('queue-poll').onclick = () => api('/ranked/queue').then(data => { if (data.match_id) { currentMatchId = data.match_id; $('match-id').textContent = currentMatchId; refreshMatch(); } }).catch(() => {});
 $('rating-get').onclick = () => api('/ranked/rating').catch(() => {});
 
+function selectProblem(id) {
+  currentProblemId = id;
+  if (!(id in revisions)) revisions[id] = 0;
+  $('selected-label').textContent = `Code — ${id}`;
+  for (const button of $('problem-picker').children) button.classList.toggle('selected', button.dataset.id === id);
+  log(`Selected problem ${id}`);
+}
+
 function renderProblems(problems) {
   $('problem-picker').innerHTML = '';
   problems.forEach(p => {
     const button = document.createElement('button');
     button.textContent = p.title;
+    button.dataset.id = p.id;
     button.style.marginRight = '6px';
-    button.onclick = () => { currentProblemId = p.id; log(`Selected problem ${p.id}`); };
+    button.onclick = () => selectProblem(p.id);
     $('problem-picker').appendChild(button);
-    if (!currentProblemId) currentProblemId = p.id;
   });
+  // Auto-select the first problem so a fresh "Refresh match" is immediately submittable.
+  if (problems.length && !problems.some(p => p.id === currentProblemId)) selectProblem(problems[0].id);
+  else if (currentProblemId) selectProblem(currentProblemId);
 }
 
 async function refreshMatch() {
@@ -182,9 +197,9 @@ $('match-get').onclick = refreshMatch;
 
 async function submitWork(report) {
   if (!currentMatchId || !currentProblemId) { log('No match/problem selected yet', 'err'); return; }
-  const body = { code: $('code').value, revision: currentRevision, report };
+  const body = { code: $('code').value, revision: revisions[currentProblemId] || 0, report };
   const result = await api(`/ranked/matches/${currentMatchId}/work/${currentProblemId}`, {method: 'PUT', body: JSON.stringify(body)}).catch(() => null);
-  if (result) currentRevision = result.revision;
+  if (result) revisions[currentProblemId] = result.revision;
 }
 $('save-draft').onclick = () => submitWork(null);
 $('submit-pass').onclick = async () => {
