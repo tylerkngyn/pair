@@ -5,14 +5,18 @@ set directly here rather than via REDIS_URL, since the lifespan branch
 that does that is a two-line wire-up with nothing left to prove once this
 passes against the same app.state attribute it sets.
 """
+import asyncio
 import time
 
 import pytest
 from fakeredis import FakeServer
 from fakeredis.aioredis import FakeRedis
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from app.main import app
+from app.practice import ranked_routes
+from app.practice.database import RankedMatch, RankedParticipant
 from app.practice.redis_ranked_queue import RedisRankedQueue
 
 FILTERS = {"categories": [], "difficulty": "mixed", "duration_minutes": 30, "problem_count": 1}
@@ -21,7 +25,10 @@ FILTERS = {"categories": [], "difficulty": "mixed", "duration_minutes": 30, "pro
 @pytest.fixture
 def client():
     with TestClient(app) as c:
-        c.app.state.ranked_queue = RedisRankedQueue(client=FakeRedis(server=FakeServer(), decode_responses=True))
+        # Exposed so a test can build a second RedisRankedQueue against the
+        # same backing store, simulating a second worker racing the first.
+        c.ranked_queue_server = FakeServer()
+        c.app.state.ranked_queue = RedisRankedQueue(client=FakeRedis(server=c.ranked_queue_server, decode_responses=True))
         try:
             yield c
         finally:
@@ -167,3 +174,55 @@ def test_match_found_pushed_over_websocket_with_redis_backend(client):
     # Delivered, so the Redis pending mailbox should already be consumed.
     as_(client, alice)
     assert client.get("/api/ranked/queue").json() == {"status": "idle"}
+
+
+def _matched_pair_past_deadline(client):
+    alice = register(client, "alice")
+    as_(client, alice)
+    client.post("/api/ranked/queue", json=FILTERS)
+    bob = register(client, "bob")
+    as_(client, bob)
+    match_id = client.post("/api/ranked/queue", json=FILTERS).json()["match_id"]
+    with client.app.state.database.session.begin() as db:
+        db.get(RankedMatch, match_id).deadline = time.time() - 1
+    return alice, bob, match_id
+
+
+def test_losing_the_finalize_lock_race_never_mutates_anything(client):
+    """The double-finalize race the Obsidian plan calls out: two workers
+    both notice the deadline passed for the same match near-simultaneously.
+    Simulated here by having a second worker win the lock a moment
+    earlier (through its own queue client against the same backing
+    Redis) and confirming the real finalize call then does nothing at
+    all — not even the Elo computation runs, let alone a DB write.
+    """
+    _alice, _bob, match_id = _matched_pair_past_deadline(client)
+
+    other_worker_queue = RedisRankedQueue(client=FakeRedis(server=client.ranked_queue_server, decode_responses=True))
+    won = asyncio.run(other_worker_queue.acquire_finalize_lock(match_id, "other-worker"))
+    assert won is True
+
+    with client.app.state.database.session.begin() as db:
+        match = db.get(RankedMatch, match_id)
+        result = asyncio.run(ranked_routes._finalize_if_ready(db, match, client.app.state.ranked_queue))
+    assert result is None
+
+    with client.app.state.database.session() as db:
+        match = db.get(RankedMatch, match_id)
+        assert match.status == "active"
+        assert match.finished_at is None
+        participants = db.scalars(select(RankedParticipant).where(RankedParticipant.match_id == match_id)).all()
+        assert all(p.outcome is None and p.rating_after is None for p in participants)
+
+
+def test_finalize_still_works_normally_with_the_lock_in_place(client):
+    """Confirms the lock is additive, not a regression: a single worker
+    with no contention still finalizes exactly as it did before the lock
+    existed.
+    """
+    alice, _bob, match_id = _matched_pair_past_deadline(client)
+
+    as_(client, alice)
+    result = client.get(f"/api/ranked/matches/{match_id}")
+    assert result.status_code == 200
+    assert result.json()["status"] == "completed"

@@ -37,11 +37,14 @@ async def lifespan(app: FastAPI):
         manager = RedisRoomManager(redis_url)
         await manager.start()
         app.state.rooms = manager
-        app.state.ranked_queue = RedisRankedQueue(redis_url)
+        ranked_queue = RedisRankedQueue(redis_url)
+        await ranked_queue.start()
+        app.state.ranked_queue = ranked_queue
         try:
             yield
         finally:
             await manager.stop()
+            await ranked_queue.stop()
             app.state.database.close()
         return
     app.state.rooms = RoomManager()

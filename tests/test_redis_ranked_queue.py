@@ -189,3 +189,56 @@ def test_matched_candidate_removed_so_a_third_join_cannot_also_match_it(two_work
         assert second_match["status"] == "queued"
 
     run(scenario)
+
+
+def test_sweep_removes_a_ghost_member_whose_meta_expired(two_workers):
+    """A crashed/vanished client's rq_meta hash can TTL out on its own,
+    but nothing else ever removes the matching ZSET member — only an
+    active sweep does, same role as the room manager's reap loop.
+    """
+    worker_a, worker_b = two_workers
+
+    async def scenario():
+        from app.practice.redis_ranked_queue import filters_key
+
+        await worker_a.join("alice", "alice", 1000, FILTERS)
+        # Simulate alice's meta having already expired without a clean
+        # leave()/match, leaving her user_id stranded in the ZSET alone.
+        await worker_a._redis.delete(worker_a._meta_key("alice"))
+
+        await worker_b._sweep_once()
+
+        remaining = await worker_a._redis.zrange(worker_a._queue_key(filters_key(FILTERS)), 0, -1)
+        assert "alice" not in remaining
+
+    run(scenario)
+
+
+def test_sweep_leaves_live_entries_alone(two_workers):
+    worker_a, worker_b = two_workers
+
+    async def scenario():
+        await worker_a.join("alice", "alice", 1000, FILTERS)
+        await worker_b._sweep_once()
+
+        polled = await worker_a.poll("alice")
+        assert polled["status"] == "queued"
+
+    run(scenario)
+
+
+def test_finalize_lock_is_exclusive_across_workers(two_workers):
+    worker_a, worker_b = two_workers
+
+    async def scenario():
+        first = await worker_a.acquire_finalize_lock("match-1", "worker-a")
+        assert first is True
+
+        second = await worker_b.acquire_finalize_lock("match-1", "worker-b")
+        assert second is False
+
+        # A different match is an entirely separate lock.
+        third = await worker_b.acquire_finalize_lock("match-2", "worker-b")
+        assert third is True
+
+    run(scenario)

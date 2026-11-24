@@ -17,12 +17,24 @@ Phase 1):
   rq_meta:<user_id>        HASH  username, rating, filters (json), queued_at,
                                   filters_hash
 A user_id's presence in `rq_meta:<id>` is itself "am I queued" - no
-separate index needed; the sweep (added alongside the finalization lock
-in a later pass) scans `rq_meta:*` directly.
+separate index needed.
+
+Why a sweep is needed at all, given every key above already carries a
+TTL: Redis expires a whole key, never an individual ZSET member. If a
+queued account's `rq_meta:<id>` hash TTLs out without an explicit
+leave()/match (its owner crashed, or the browser was just closed), its
+user_id is still sitting in `rq:<filters_hash>` as a ghost member - both
+matching scripts already skip it safely (their `#meta > 0` check), but
+nothing ever ZREMs it, so it lingers (and gets rescanned on every
+match attempt in that filter group) until the whole ZSET key's own TTL
+finally expires. start()/_sweep_once() below is that ZREM, the same
+role app/redis_room_manager.py's reap loop plays for room membership.
 """
 
+import asyncio
 import hashlib
 import json
+import os
 import time
 
 from redis.asyncio import Redis
@@ -30,8 +42,14 @@ from redis.asyncio import Redis
 QUEUE_KEY_PREFIX = "rq:"
 META_KEY_PREFIX = "rq_meta:"
 PENDING_KEY_PREFIX = "rq_pending:"
+FINALIZE_LOCK_PREFIX = "match_lock:"
 ENTRY_TTL_SECONDS = 600  # Safety net only; explicit leave/match removes entries immediately.
 PENDING_TTL_SECONDS = 300  # How long a MATCH_FOUND notice waits for a poll if the WS push never confirms.
+FINALIZE_LOCK_TTL_SECONDS = 10  # Generous for one Elo update + two Rating writes; see acquire_finalize_lock.
+
+# Overridable only for tests, same convention as app/redis_room_manager.py's
+# PAIR_PRESENCE_TTL_SECONDS/PAIR_REAP_INTERVAL_SECONDS.
+SWEEP_INTERVAL_SECONDS = int(os.environ.get("PAIR_QUEUE_SWEEP_INTERVAL_SECONDS", "30"))
 
 MIN_WINDOW = 50
 WINDOW_STEP = 25
@@ -139,6 +157,46 @@ class RedisRankedQueue:
         self._redis = client if client is not None else Redis.from_url(redis_url, decode_responses=True)
         self._join_script = self._redis.register_script(_JOIN_SCRIPT)
         self._poll_script = self._redis.register_script(_POLL_SCRIPT)
+        self._sweep_task: asyncio.Task | None = None
+
+    async def start(self) -> None:
+        self._sweep_task = asyncio.create_task(self._sweep_loop())
+
+    async def stop(self) -> None:
+        if self._sweep_task is not None:
+            self._sweep_task.cancel()
+            try:
+                await self._sweep_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _sweep_loop(self) -> None:
+        while True:
+            await asyncio.sleep(SWEEP_INTERVAL_SECONDS)
+            await self._sweep_once()
+
+    async def _sweep_once(self) -> None:
+        """Removes ghost ZSET members — see the module docstring for why
+        these can exist despite every key carrying a TTL. Scans every
+        filter group, not just ones this call happens to know about,
+        since a crashed worker's own bookkeeping (if it even had any) is
+        gone — only a sweep from any still-running process can notice.
+        """
+        async for key in self._redis.scan_iter(match=f"{QUEUE_KEY_PREFIX}*"):
+            members = await self._redis.zrange(key, 0, -1)
+            if not members:
+                continue
+            # One pipelined round trip for every member's meta-existence
+            # check, instead of one EXISTS per member, so a sweep's cost
+            # doesn't scale with total queued accounts times a round trip —
+            # same reasoning as the room manager's reap sweep.
+            pipeline = self._redis.pipeline(transaction=False)
+            for user_id in members:
+                pipeline.exists(self._meta_key(user_id))
+            alive = await pipeline.execute()
+            ghosts = [user_id for user_id, is_alive in zip(members, alive) if not is_alive]
+            if ghosts:
+                await self._redis.zrem(key, *ghosts)
 
     def _queue_key(self, group: str) -> str:
         return f"{QUEUE_KEY_PREFIX}{group}"
@@ -236,6 +294,23 @@ class RedisRankedQueue:
         await self._redis.delete(self._meta_key(user_id))
         await self._redis.zrem(self._queue_key(own["filters_hash"]), user_id)
         return True
+
+    async def acquire_finalize_lock(self, match_id: str, worker_id: str) -> bool:
+        """First line of defense against two workers both running Elo
+        finalization for the same match at the same moment — e.g. both
+        notice the shared deadline passed within the same instant on a
+        GET /api/ranked/matches/{id} each happened to receive. True means
+        this call won the lock and should proceed; False means another
+        worker already holds it (or just finished and the lock hasn't
+        expired yet), so this caller must not finalize.
+
+        Deliberately NOT the only guard: _finalize_if_ready's DB-side
+        `status == "active"` check is a second, independent safety net in
+        ranked_routes.py, in case this lock is ever misused or expires
+        mid-operation (NX EX 10 is generous for how fast one Elo update +
+        two Rating writes should take, but not infinite).
+        """
+        return bool(await self._redis.set(f"{FINALIZE_LOCK_PREFIX}{match_id}", worker_id, nx=True, ex=FINALIZE_LOCK_TTL_SECONDS))
 
 
 def _decode_opponent(user_id: str, fields: dict) -> dict:

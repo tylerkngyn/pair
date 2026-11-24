@@ -22,6 +22,7 @@ import os
 import shutil
 import socket as socketlib
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -110,7 +111,7 @@ def two_workers(real_redis_url):
     try:
         for port in ports:
             proc = subprocess.Popen(
-                ["python", "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", str(port)],
+                [sys.executable, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", str(port)],
                 cwd=REPO_ROOT, env=env,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             )

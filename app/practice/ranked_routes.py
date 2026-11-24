@@ -51,6 +51,12 @@ router = APIRouter(prefix="/api/ranked")
 # sees every waiting player.
 _LOCK = threading.Lock()
 _QUEUE: list[dict] = []  # [{user_id, username, filters, rating, queued_at}]
+# Identifies this process as the holder of a finalize lock, so acquiring
+# it twice from the SAME worker (e.g. two requests racing in-process,
+# which the DB status guard already handles) isn't confused with two
+# different workers racing — not load-bearing for correctness, just a
+# readable value in Redis over a meaningless token.
+_WORKER_ID = secrets.token_hex(8)
 _PENDING_MATCH: dict[str, str] = {}  # user_id -> match_id, consumed by one poll
 
 MIN_WINDOW = 50
@@ -339,20 +345,52 @@ def _owned_participant(db, match_id, user_id):
     return participant
 
 
-def _finalize_if_ready(db, match: RankedMatch):
+async def _finalize_if_ready(db, match: RankedMatch, redis_queue=None):
     """Elo update is idempotent via the active->completed status guard, so a
     second caller racing this on another request is a no-op, not a double
-    payout. The real exactly-once guarantee across *workers* is a Phase 2
-    concern (a Redis finalization lock); single-process Phase 1 only needs
-    this status check.
+    payout. That guard alone is Phase 1's whole story (single process, so
+    it's the only race that can happen); once more than one worker can
+    reach this for the same match, the gap between "read status == active"
+    and "write status = completed" is wide enough (a full Elo computation
+    plus a DB write) for two workers to both pass the read before either
+    writes. `redis_queue.acquire_finalize_lock`, when a Redis backend is
+    configured, closes that gap — only the worker that wins the lock
+    proceeds; the status guard remains the second, independent safety net
+    for exactly the reason its own docstring there gives.
 
     Returns {user_id: MatchResultPayload-shaped dict} if this call is the
-    one that finalized the match, else None (either still active, or
-    already completed by an earlier call) — the caller uses this to know
-    whether to push MATCH_RESULT, since it should fire exactly once.
+    one that finalized the match, else None (still active, already
+    completed by an earlier call, or lost the finalize-lock race to
+    another worker) — the caller uses this to know whether to push
+    MATCH_RESULT, since it should fire exactly once.
     """
     if match.status != "active":
         return None
+    # Checked before the lock and the expensive per-problem queries below:
+    # no reason to take a 10-second lock, or do any of that work, for a
+    # match that isn't actually ready yet. (Early "both sides confirmed
+    # ready" finalization is deferred past Phase 1 — only the deadline
+    # passing finalizes a match.)
+    if time.time() <= match.deadline:
+        return None
+    if redis_queue is not None and not await redis_queue.acquire_finalize_lock(match.id, _WORKER_ID):
+        return None
+    # The actual DB-side transition guard: an atomic conditional UPDATE,
+    # not an ORM attribute set applied later. Claiming the transition
+    # BEFORE computing or writing any Elo/Rating changes means a losing
+    # racer (the finalize lock failed to prevent it, or expired mid-flight)
+    # bails out here with nothing mutated yet, rather than needing to
+    # discard already-staged ORM changes on a late "actually, no" — which
+    # a plain `match.status = "completed"` at the end of this function
+    # can't do, since by then the result would already be half-built.
+    now = time.time()
+    claimed = db.execute(
+        update(RankedMatch).where(RankedMatch.id == match.id, RankedMatch.status == "active")
+        .values(status="completed", finished_at=now)
+    )
+    if claimed.rowcount != 1:
+        return None
+    match.status, match.finished_at = "completed", now
     participants = list(db.scalars(select(RankedParticipant).where(RankedParticipant.match_id == match.id)))
     if len(participants) != 2:
         return None
@@ -363,11 +401,6 @@ def _finalize_if_ready(db, match: RankedMatch):
         last_submit = max((w.result["submitted_at"] for w in work if w.result), default=match.deadline)
         attempted = any(status != "not_started" for status in statuses.values())
         work_by_user[participant.user_id] = {"correctness": correctness, "elapsed": last_submit - match.started_at, "attempted": attempted}
-    now = time.time()
-    # A match finalizes once the deadline has passed. (Early "both sides
-    # confirmed ready" finalization is deferred past Phase 1.)
-    if now <= match.deadline:
-        return None
     a, b = participants
     a_info, b_info = work_by_user[a.user_id], work_by_user[b.user_id]
     if not a_info["attempted"] and not b_info["attempted"]:
@@ -407,8 +440,6 @@ def _finalize_if_ready(db, match: RankedMatch):
             "rating_before": participant.rating_before, "rating_after": new_rating,
             "opponent_rating_after": opponent_new_rating,
         }
-    match.status = "completed"
-    match.finished_at = now
     db.flush()
     return results
 
@@ -502,7 +533,7 @@ async def get_match(match_id: str, request: Request, identity=Depends(auth.curre
         if match is None:
             raise HTTPException(404, "Match not found")
         participant = _owned_participant(db, match_id, identity[0].id)
-        results = _finalize_if_ready(db, match)
+        results = await _finalize_if_ready(db, match, _redis_queue(request))
         opponent = db.scalar(select(RankedParticipant).where(RankedParticipant.match_id == match_id, RankedParticipant.user_id != identity[0].id))
         response = {
             "id": match.id, "status": match.status, "deadline": match.deadline, "finished_at": match.finished_at,
