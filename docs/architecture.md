@@ -27,7 +27,7 @@ flowchart TB
     P --> T[Correctness + invocation timing]
     T -->|Browser-reported result| U
     U -->|Save submission and code revision| S
-    U -. future multiplayer .-> WS[Retained WebSocket room layer]
+    U -. ranked mode: see the distributed-matchmaking diagram below .-> WS[WebSocket room/match layer]
 ```
 
 FastAPI handles accounts, ownership, problem selection, session deadlines, draft versions, and result persistence. It does not execute submitted code. Execution is confined to the user's browser. This avoids operating a paid execution service and keeps CPU-bound user code out of the web-server process.
@@ -261,6 +261,37 @@ Implemented in `app/practice/database.py`: `Rating`, `RankedMatch`, `RankedParti
 Lazy, not event-driven: `GET /api/ranked/matches/{id}` checks `status == "active" and time.time() > deadline` on every read and runs the Elo update + both `Rating` writes in the same transaction if so, then flips `status` to `"completed"`. The status-guard read-then-write is single-process-safe for Phase 1; the Obsidian plan's Phase 2 section covers the additional Redis finalization lock still needed once two workers can race this — not yet built; see "Phase 2: distributed matchmaking" below for what has.
 
 ### Phase 2: distributed matchmaking — implemented
+
+```mermaid
+flowchart TB
+    BA[Player A browser] -->|HTTPS: POST/GET/DELETE /api/ranked/queue| R1
+    BB[Player B browser] -->|HTTPS: same, lands on a different worker| R2
+    BA <-.->|WS: match_found, opponent_progress, match_result| RM1
+    BB <-.->|WS: same events| RM2
+
+    subgraph Worker1[Worker 1]
+        R1[ranked_routes.py]
+        RM1[RoomManager or RedisRoomManager]
+    end
+    subgraph Worker2[Worker 2]
+        R2[ranked_routes.py]
+        RM2[RoomManager or RedisRoomManager]
+    end
+
+    R1 -.->|REDIS_URL unset: default| Q1[(in-process queue, this worker only)]
+    R2 -.->|REDIS_URL unset: default| Q2[(in-process queue, this worker only)]
+    R1 -->|REDIS_URL set| RQ[RedisRankedQueue: join and poll Lua scripts]
+    R2 -->|REDIS_URL set| RQ
+    RQ --> REDIS[(Redis: ranked queue ZSET, meta hash, pending mailbox)]
+
+    RM1 -->|REDIS_URL set: user and room channels, plus ack keys| REDIS
+    RM2 -->|REDIS_URL set: same channels, cross-worker delivery| REDIS
+
+    R1 --> DB[(RankedMatch, RankedParticipant, RankedWork, Rating)]
+    R2 --> DB
+```
+
+Solid arrows into Redis are only active once `REDIS_URL` is set; the dashed in-process-queue arrows are what each worker falls back to otherwise. The exact same deploy, with no code change, degrades to two independent single-worker islands without `REDIS_URL` set — each worker's in-process queue and `RoomManager` only ever sees its own requests and sockets. `ranked_routes.py` and `app/main.py`'s lifespan are what decide which path is live, per the "Wiring" note below; the database is the one thing both workers always share regardless, since it was never in-process to begin with.
 
 `app/practice/redis_ranked_queue.py`'s `RedisRankedQueue` replaces the Phase 1 in-process `_QUEUE`/`_PENDING_MATCH` globals once more than one worker needs to see the same waiting players — the same problem `app/redis_room_manager.py` already solves for chat/ranked rooms, applied to matchmaking instead of room membership.
 
