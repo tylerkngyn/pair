@@ -50,6 +50,42 @@ class Work(Base):
     revision = Column(Integer, nullable=False, default=0)
 
 
+class Rating(Base):
+    __tablename__ = "ranked_ratings"
+    user_id = Column(String(64), ForeignKey("users.id"), primary_key=True)
+    rating = Column(Integer, nullable=False, default=1000)
+    matches_played = Column(Integer, nullable=False, default=0)
+    updated_at = Column(Float, nullable=False)
+
+
+class RankedMatch(Base):
+    __tablename__ = "ranked_matches"
+    id = Column(String(64), primary_key=True)
+    problem_ids = Column(JSON, nullable=False)
+    started_at = Column(Float, nullable=False)
+    deadline = Column(Float, nullable=False)
+    finished_at = Column(Float)
+    status = Column(String(16), nullable=False, default="active")
+
+
+class RankedParticipant(Base):
+    __tablename__ = "ranked_participants"
+    match_id = Column(String(64), ForeignKey("ranked_matches.id"), primary_key=True)
+    user_id = Column(String(64), ForeignKey("users.id"), primary_key=True)
+    rating_before = Column(Integer, nullable=False)
+    rating_after = Column(Integer)
+    outcome = Column(String(16))
+
+
+class RankedWork(Base):
+    __tablename__ = "ranked_work"
+    match_id = Column(String(64), ForeignKey("ranked_matches.id"), primary_key=True)
+    problem_id = Column(String(100), primary_key=True)
+    code = Column(String(50000), nullable=False, default="")
+    result = Column(JSON)
+    revision = Column(Integer, nullable=False, default=0)
+
+
 class Database:
     def __init__(self, url=None):
         if url is None:

@@ -44,6 +44,9 @@ class RoomManager:
         await socket.accept()
         return Peer(socket=socket)
 
+    async def heartbeat(self, peer: Peer) -> None:
+        """No-op here; only RedisRoomManager needs a liveness signal to reap."""
+
     async def send(self, peer: Peer, event: ServerEvent) -> bool:
         """Serialize sends per socket; a slow/broken peer cannot stall forever."""
         try:

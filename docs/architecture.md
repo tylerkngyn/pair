@@ -150,6 +150,79 @@ Keep practice rules and execution independent of room storage. A later paired in
 
 Integrate the existing GitHub Redis implementation deliberately before scaling chat workers. Redis Pub/Sub is live delivery without durable replay; do not use it as the only store for submissions or grades. Shared editing needs a conflict strategy beyond whole-draft last-writer updates. A trusted multiplayer assessment also needs a separate server-side execution service; current browser scores remain self-reported.
 
+## Ranked mode contract (draft, Phase 0)
+
+Not implemented. This is the Pydantic request/response contract for the two-player ranked NeetCode feature described in the project's Obsidian plan, published here so frontend work can start against a fixed shape before the backend lands, per the ownership rule above. Junze owns edits to this section; changes here should land before the dependent frontend/backend code, not after.
+
+### HTTP
+
+`POST /api/ranked/queue` — request:
+
+```json
+{"categories": ["arrays", "graphs"], "difficulty": "mixed", "duration_minutes": 30, "problem_count": 2}
+```
+
+Same field constraints as the existing solo `Settings` model (`duration_minutes` 5–180, `problem_count` 1–5, `categories` max 20). No `allow_overtime` or `problem_ids` field — ranked matches are always strict-deadline and always randomized (see "Open questions" in the Obsidian note on why overtime is excluded). Response, `202`:
+
+```json
+{"status": "queued", "queued_at": 1764012345.0}
+```
+
+`DELETE /api/ranked/queue` — no body. `200` `{"status": "left"}`, or `409` `{"detail": "Already matched"}` if a match was found before the cancel was processed.
+
+`GET /api/ranked/rating` — `200`:
+
+```json
+{"rating": 1000, "matches_played": 0, "tier": "Bronze"}
+```
+
+`tier` is computed server-side from `rating` at response time (400-point bands) so the client never re-implements the tier boundaries; it is never stored.
+
+`GET /api/ranked/history` — `200`, same pagination shape (latest 30) as `GET /api/practice`:
+
+```json
+{
+  "matches": [
+    {
+      "id": "a1b2c3",
+      "opponent": "someuser",
+      "started_at": 1764012000.0,
+      "finished_at": 1764013800.0,
+      "outcome": "win",
+      "rating_before": 1000,
+      "rating_after": 1016,
+      "problems": [{"id": "two-sum", "title": "Two Sum", "category": "arrays", "difficulty": "easy"}]
+    }
+  ]
+}
+```
+
+### WebSocket (extends the existing `/ws` event union in `app/models.py`)
+
+`MATCH_FOUND` (server → both clients):
+
+```json
+{"type": "match_found", "payload": {"match_id": "a1b2c3", "opponent": "someuser", "opponent_rating": 1042, "deadline": 1764013800.0, "problems": [{"id": "two-sum", "title": "Two Sum"}]}}
+```
+
+`OPPONENT_PROGRESS` (server → the other client only; broadcast on every opponent Submit):
+
+```json
+{"type": "opponent_progress", "payload": {"problem_statuses": {"two-sum": "passed", "lru-cache": "attempted"}, "correctness": 62.5}}
+```
+
+Never contains code, stdout, or per-case detail — see the trust-boundary note in the Obsidian plan on why this stays coarse.
+
+`MATCH_RESULT` (server → both clients, once):
+
+```json
+{"type": "match_result", "payload": {"outcome": "win", "my_correctness": 100.0, "opponent_correctness": 62.5, "rating_before": 1000, "rating_after": 1016, "opponent_rating_after": 1026}}
+```
+
+### Data model
+
+See the Obsidian plan's "Data model additions" table for `Rating` / `RankedMatch` / `RankedParticipant` / `RankedWork`; the ER shape added to this document's diagram above once the SQLAlchemy models land in `app/practice/database.py`.
+
 ## Verification and remaining work
 
 The automated suite passes 197 tests covering the 150 reference implementations and starter failures, alternative outputs/deep-copy checks, account hashing/cookies/revocation/CSRF/limits, ownership isolation, stale revisions, score invalidation, configuration, deadlines/overtime, restart persistence, execution boundaries, bundled asset delivery, and retained chat lifecycle. With all external HTTP requests blocked, the real-browser workflow passes account creation/login/history, Run/Submit, runtime reuse, themes, mobile layout, opaque-origin isolation, Stop, and automatic execution timeout. Injected missing-asset and stalled-download checks also pass: controls recover, Stop cancels loading, and retry succeeds. The extended browser run passes every reference across all 150 problems and 460 fixtures using the app's real bundled files, without a test-only CDN replacement.

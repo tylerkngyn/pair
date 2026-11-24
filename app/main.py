@@ -1,6 +1,7 @@
 """HTTP entry points and WebSocket protocol dispatch."""
 
 import asyncio
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -10,7 +11,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
-from app.models import ChatEvent, JoinEvent, ReactionEvent, TypingEvent, client_event_adapter
+from app.models import ChatEvent, JoinEvent, PingEvent, ReactionEvent, TypingEvent, client_event_adapter
 from app.room_manager import RoomManager
 from app.practice.database import Database
 from app.practice.routes import router as practice_router
@@ -21,8 +22,25 @@ MAX_FRAME_CHARS = 8192
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.rooms = RoomManager()
     app.state.database = Database()
+    # REDIS_URL stays unset for solo chat and single-instance deploys; a
+    # WebSocket connection cannot leave the worker process that accepted it,
+    # so this only matters once there is more than one worker/instance, which
+    # ranked mode's shared-room matches are the first feature to need. See
+    # the Obsidian plan's "Distributed backend for ranked mode" section.
+    redis_url = os.environ.get("REDIS_URL")
+    if redis_url:
+        from app.redis_room_manager import RedisRoomManager
+        manager = RedisRoomManager(redis_url)
+        await manager.start()
+        app.state.rooms = manager
+        try:
+            yield
+        finally:
+            await manager.stop()
+            app.state.database.close()
+        return
+    app.state.rooms = RoomManager()
     try:
         yield
     finally:
@@ -105,7 +123,10 @@ async def websocket_endpoint(socket: WebSocket):
                 await manager.typing(peer, event.payload.typing)
             elif isinstance(event, ReactionEvent):
                 await manager.react(peer, event.payload.emoji)
-            # ping is deliberately one-way; the protocol has no pong event.
+            elif isinstance(event, PingEvent):
+                # One-way; the protocol has no pong event. Also refreshes
+                # Redis-side presence so a crashed worker's peers can be reaped.
+                await manager.heartbeat(peer)
     except (WebSocketDisconnect, OSError):
         pass
     except TimeoutError:
