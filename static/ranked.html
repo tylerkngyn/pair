@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ranked test</title>
+<style>
+  body { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; max-width: 820px; margin: 24px auto; padding: 0 16px; background:#1c1c1c; color:#ccc; }
+  h1 { font-size: 18px; }
+  h2 { font-size: 14px; color:#9a9a9a; margin-top: 28px; }
+  section { border: 1px solid #3b3b3b; border-radius: 6px; padding: 12px 14px; margin-bottom: 16px; }
+  label { display:block; margin: 6px 0 2px; font-size: 12px; color:#9a9a9a; }
+  input, select, button, textarea { font: inherit; background:#202020; color:#ccc; border:1px solid #6b6b6b; border-radius:3px; padding: 6px 8px; }
+  button { cursor: pointer; }
+  button:hover { background:#292929; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  textarea { width: 100%; height: 90px; }
+  .row { display:flex; gap:12px; flex-wrap: wrap; align-items:flex-end; }
+  .row > div { flex: 1; min-width: 120px; }
+  pre { background:#111; padding:8px; border-radius:4px; overflow:auto; max-height:260px; white-space:pre-wrap; word-break:break-all; }
+  #log div { padding: 2px 0; border-bottom: 1px solid #292929; }
+  .ok { color:#8fbf8f; } .err { color:#d08a8a; } .evt { color:#8aa9d0; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; border:1px solid #6b6b6b; margin-left:6px; }
+</style>
+</head>
+<body>
+<h1>Ranked mode — manual test page <span id="who" class="pill"></span></h1>
+<p style="color:#9a9a9a">Not part of the product UI. Open this page in two browser profiles (or two private windows) to play both sides of a match.</p>
+
+<section>
+  <h2>Account</h2>
+  <div class="row">
+    <div><label>Username</label><input id="username" value="tester"></div>
+    <div><label>Password</label><input id="password" type="password" value="good-password-123"></div>
+    <div><button id="register">Register</button></div>
+    <div><button id="login">Log in</button></div>
+    <div><button id="logout">Log out</button></div>
+  </div>
+</section>
+
+<section>
+  <h2>WebSocket (/ws, auto-identified from your login cookie)</h2>
+  <div class="row">
+    <div><button id="ws-connect">Connect</button></div>
+    <div><button id="ws-disconnect">Disconnect</button></div>
+    <div>status: <span id="ws-status">disconnected</span></div>
+  </div>
+</section>
+
+<section>
+  <h2>Queue</h2>
+  <div class="row">
+    <div><label>Categories (comma-separated, blank = any)</label><input id="categories"></div>
+    <div><label>Difficulty</label>
+      <select id="difficulty"><option>mixed</option><option>easy</option><option>medium</option><option>hard</option></select>
+    </div>
+    <div><label>Duration (min)</label><input id="duration" type="number" value="30"></div>
+    <div><label>Problems</label><input id="count" type="number" value="1"></div>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <div><button id="queue-join">Join queue</button></div>
+    <div><button id="queue-leave">Leave queue</button></div>
+    <div><button id="queue-poll">Poll status</button></div>
+    <div><button id="rating-get">My rating</button></div>
+  </div>
+</section>
+
+<section>
+  <h2>Match <span id="match-id" class="pill"></span></h2>
+  <div class="row">
+    <div><button id="match-get">Refresh match</button></div>
+  </div>
+  <div id="problem-picker"></div>
+  <label>Code</label>
+  <textarea id="code">def solve():
+    pass</textarea>
+  <div class="row" style="margin-top:8px">
+    <div><button id="submit-pass">Submit as all-passing</button></div>
+    <div><button id="submit-fail">Submit as all-failing</button></div>
+    <div><button id="save-draft">Save draft only (no report)</button></div>
+  </div>
+</section>
+
+<section>
+  <h2>History</h2>
+  <button id="history-get">Refresh history</button>
+  <pre id="history-out">—</pre>
+</section>
+
+<h2>Event log</h2>
+<div id="log"></div>
+
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+let csrf = null, username = null, ws = null;
+let currentMatchId = null, currentProblemId = null, currentRevision = 0;
+
+function log(text, cls) {
+  const line = document.createElement('div');
+  if (cls) line.className = cls;
+  line.textContent = `[${new Date().toLocaleTimeString()}] ${text}`;
+  $('log').prepend(line);
+}
+
+async function api(path, options = {}) {
+  const headers = { ...(options.body ? {'Content-Type': 'application/json'} : {}), ...(csrf ? {'X-CSRF-Token': csrf} : {}), ...options.headers };
+  const response = await fetch(`/api${path}`, { ...options, headers, credentials: 'same-origin' });
+  let body = null;
+  try { body = await response.json(); } catch {}
+  if (!response.ok) {
+    const detail = typeof body?.detail === 'string' ? body.detail : JSON.stringify(body?.detail ?? body);
+    log(`${options.method || 'GET'} ${path} -> ${response.status}: ${detail}`, 'err');
+    throw new Error(detail);
+  }
+  log(`${options.method || 'GET'} ${path} -> ${response.status}: ${JSON.stringify(body)}`, 'ok');
+  return body;
+}
+
+function setIdentity(data) {
+  csrf = data.csrf;
+  username = data.username;
+  $('who').textContent = username ? `signed in: ${username}` : '';
+}
+
+$('register').onclick = () => api('/auth/register', {method: 'POST', body: JSON.stringify({username: $('username').value, password: $('password').value})}).then(setIdentity).catch(() => {});
+$('login').onclick = () => api('/auth/login', {method: 'POST', body: JSON.stringify({username: $('username').value, password: $('password').value})}).then(setIdentity).catch(() => {});
+$('logout').onclick = () => api('/auth/logout', {method: 'POST'}).then(() => setIdentity({csrf: null, username: null})).catch(() => {});
+
+function wsEvent(event) {
+  log(`WS <- ${JSON.stringify(event)}`, 'evt');
+  if (event.type === 'match_found') {
+    currentMatchId = event.payload.match_id;
+    $('match-id').textContent = currentMatchId;
+    refreshMatch();
+  } else if (event.type === 'match_result') {
+    refreshMatch();
+  }
+}
+
+$('ws-connect').onclick = () => {
+  if (ws) return;
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => { $('ws-status').textContent = 'connected'; log('WS connected'); };
+  ws.onclose = () => { $('ws-status').textContent = 'disconnected'; ws = null; log('WS closed'); };
+  ws.onerror = () => log('WS error', 'err');
+  ws.onmessage = e => wsEvent(JSON.parse(e.data));
+  // Keeps the socket alive while queued (no room joined yet).
+  ws._ping = setInterval(() => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({type: 'ping', payload: {}})); }, 10000);
+};
+$('ws-disconnect').onclick = () => { if (ws) { clearInterval(ws._ping); ws.close(); ws = null; } };
+
+$('queue-join').onclick = () => api('/ranked/queue', {method: 'POST', body: JSON.stringify({
+  categories: $('categories').value.split(',').map(s => s.trim()).filter(Boolean),
+  difficulty: $('difficulty').value,
+  duration_minutes: Number($('duration').value),
+  problem_count: Number($('count').value),
+})}).then(data => { if (data.match_id) { currentMatchId = data.match_id; $('match-id').textContent = currentMatchId; refreshMatch(); } }).catch(() => {});
+$('queue-leave').onclick = () => api('/ranked/queue', {method: 'DELETE'}).catch(() => {});
+$('queue-poll').onclick = () => api('/ranked/queue').then(data => { if (data.match_id) { currentMatchId = data.match_id; $('match-id').textContent = currentMatchId; refreshMatch(); } }).catch(() => {});
+$('rating-get').onclick = () => api('/ranked/rating').catch(() => {});
+
+function renderProblems(problems) {
+  $('problem-picker').innerHTML = '';
+  problems.forEach(p => {
+    const button = document.createElement('button');
+    button.textContent = p.title;
+    button.style.marginRight = '6px';
+    button.onclick = () => { currentProblemId = p.id; log(`Selected problem ${p.id}`); };
+    $('problem-picker').appendChild(button);
+    if (!currentProblemId) currentProblemId = p.id;
+  });
+}
+
+async function refreshMatch() {
+  if (!currentMatchId) return;
+  const data = await api(`/ranked/matches/${currentMatchId}`).catch(() => null);
+  if (data) renderProblems(data.problems);
+}
+$('match-get').onclick = refreshMatch;
+
+async function submitWork(report) {
+  if (!currentMatchId || !currentProblemId) { log('No match/problem selected yet', 'err'); return; }
+  const body = { code: $('code').value, revision: currentRevision, report };
+  const result = await api(`/ranked/matches/${currentMatchId}/work/${currentProblemId}`, {method: 'PUT', body: JSON.stringify(body)}).catch(() => null);
+  if (result) currentRevision = result.revision;
+}
+$('save-draft').onclick = () => submitWork(null);
+$('submit-pass').onclick = async () => {
+  const match = await api(`/ranked/matches/${currentMatchId}`).catch(() => null);
+  if (!match) return;
+  const problem = match.problems.find(p => p.id === currentProblemId);
+  // test_count isn't in match detail; fall back to catalog for the exact case count.
+  const catalog = await api('/catalog').catch(() => null);
+  const total = catalog?.problems.find(p => p.id === currentProblemId)?.test_count || 1;
+  submitWork({ passed: total, total, cases: Array.from({length: total}, () => ({passed: true})) });
+};
+$('submit-fail').onclick = async () => {
+  const catalog = await api('/catalog').catch(() => null);
+  const total = catalog?.problems.find(p => p.id === currentProblemId)?.test_count || 1;
+  submitWork({ passed: 0, total, cases: Array.from({length: total}, () => ({passed: false})) });
+};
+
+$('history-get').onclick = () => api('/ranked/history').then(data => $('history-out').textContent = JSON.stringify(data, null, 2)).catch(() => {});
+</script>
+</body>
+</html>

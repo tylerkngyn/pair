@@ -83,6 +83,15 @@ async def legacy_chat():
     return FileResponse(INDEX.with_name("chat.html"))
 
 
+@app.get("/ranked", response_class=FileResponse)
+async def ranked_test_page():
+    """Manual test page for ranked mode: not part of the product UI, just
+    a thin client over the real /api/ranked/* + /ws contract so the backend
+    can be exercised by hand before Tyler builds the real frontend.
+    """
+    return FileResponse(INDEX.with_name("ranked.html"))
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
