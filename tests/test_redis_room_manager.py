@@ -9,8 +9,17 @@ import pytest
 from fakeredis import FakeServer
 from fakeredis.aioredis import FakeRedis
 
+import app.redis_room_manager as redis_room_manager
 from app.models import SystemEvent, SystemPayload
 from app.redis_room_manager import Peer, RedisRoomManager
+
+
+@pytest.fixture(autouse=True)
+def fast_ack_wait(monkeypatch):
+    # The real default (0.5s) is sized for production network latency; here
+    # it would just slow down every "delivery correctly failed" test for no
+    # benefit, since fakeredis has no real latency to wait out.
+    monkeypatch.setattr(redis_room_manager, "ACK_WAIT_SECONDS", 0.05)
 
 
 class FakeSocket:
@@ -359,12 +368,38 @@ def test_send_to_user_reaches_account_on_a_different_worker(two_workers):
     run_with_workers(worker_a, worker_b, scenario)
 
 
-def test_send_to_user_unknown_account_is_a_silent_no_op(two_workers):
+def test_send_to_user_unknown_account_reports_undelivered(two_workers):
+    """No subscriber anywhere ever sets the ack key, so this must report
+    False rather than the old always-True behavior — a caller treating the
+    return value as a real delivery confirmation (ranked_routes.py's
+    _PENDING_MATCH cleanup) would otherwise wrongly believe it arrived.
+    """
     worker_a, worker_b = two_workers
 
     async def scenario():
-        await worker_a.send_to_user("nobody-queued", SystemEvent(payload=SystemPayload(text="match found")))
-        await settle()  # Nothing should raise; there's simply no local peer anywhere to deliver to.
+        delivered = await worker_a.send_to_user("nobody-queued", SystemEvent(payload=SystemPayload(text="match found")))
+        assert delivered is False
+
+    run_with_workers(worker_a, worker_b, scenario)
+
+
+def test_send_to_user_failed_local_send_reports_undelivered(two_workers):
+    """The target account exists on another worker, but its socket send
+    actually fails there — the ack must only be set on a *successful*
+    _send_raw, not merely on finding a local peer to attempt delivery to.
+    """
+    worker_a, worker_b = two_workers
+
+    class BrokenSocket(FakeSocket):
+        async def send_json(self, event):
+            raise RuntimeError("socket is closed")
+
+    async def scenario():
+        alice = Peer(socket=BrokenSocket())
+        await worker_a.identify(alice, "user-alice")
+
+        delivered = await worker_b.send_to_user("user-alice", SystemEvent(payload=SystemPayload(text="match found")))
+        assert delivered is False
 
     run_with_workers(worker_a, worker_b, scenario)
 
@@ -377,9 +412,10 @@ def test_disconnect_clears_user_identity(two_workers):
         await worker_a.identify(alice, "user-alice")
         await worker_a.disconnect(alice)
 
-        await worker_b.send_to_user("user-alice", SystemEvent(payload=SystemPayload(text="match found")))
+        delivered = await worker_b.send_to_user("user-alice", SystemEvent(payload=SystemPayload(text="match found")))
         await settle()
 
+        assert delivered is False
         assert alice.socket.events == []
 
     run_with_workers(worker_a, worker_b, scenario)

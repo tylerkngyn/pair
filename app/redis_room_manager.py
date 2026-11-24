@@ -21,9 +21,14 @@ from redis.asyncio import Redis
 
 CHANNEL_PREFIX = "chan:"
 USER_CHANNEL_PREFIX = "user:"
+ACK_KEY_PREFIX = "ack:"
 ROOM_KEY_PREFIX = "room:"
 PRESENCE_KEY_PREFIX = "presence:"
 ROOM_TTL_SECONDS = 3600  # Safety net only; rooms are deleted explicitly on empty.
+
+ACK_WAIT_SECONDS = float(os.environ.get("PAIR_ACK_WAIT_SECONDS", "0.5"))
+ACK_POLL_INTERVAL_SECONDS = 0.02
+ACK_TTL_SECONDS = 5  # Only needs to outlive the wait above; a generous margin.
 
 # Overridable only for integration tests, to avoid waiting out the real
 # ~2 minute worst case; production defaults are unchanged.
@@ -149,15 +154,27 @@ class RedisRoomManager:
         locally (if any) actually delivers it. Unlike room events, this
         is point-to-point — no membership state, no eviction notice.
 
-        Always returns True: unlike RoomManager's version, this can't
-        confirm a different worker actually delivered it, only that the
-        publish went out. A caller using the return value as a delivery
-        confirmation (ranked_routes.py's _PENDING_MATCH cleanup does) will
-        treat every push as delivered in Redis-backed deployments — the
-        poll fallback still exists for exactly this reason.
+        Confirms real delivery across workers via a one-shot ack key: the
+        envelope carries a nonce, whichever worker's _listen successfully
+        delivers it locally sets `ack:<nonce>` in Redis, and this polls for
+        that key up to ACK_WAIT_SECONDS before giving up. A publish with no
+        subscriber anywhere, or a target worker that fails to actually
+        write to the socket, correctly reports False — callers (e.g.
+        ranked_routes.py's _PENDING_MATCH cleanup) can treat a True return
+        here exactly like RoomManager's.
         """
-        await self._redis.publish(f"{USER_CHANNEL_PREFIX}{user_id}", json.dumps(event.model_dump()))
-        return True
+        nonce = secrets.token_hex(8)
+        envelope = {"nonce": nonce, "event": event.model_dump()}
+        await self._redis.publish(f"{USER_CHANNEL_PREFIX}{user_id}", json.dumps(envelope))
+        ack_key = f"{ACK_KEY_PREFIX}{nonce}"
+        deadline = time.monotonic() + ACK_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            if await self._redis.exists(ack_key):
+                await self._redis.delete(ack_key)
+                return True
+            await asyncio.sleep(ACK_POLL_INTERVAL_SECONDS)
+        await self._redis.delete(ack_key)  # Covers a late ack arriving after we already gave up.
+        return False
 
     async def _room_state_event(self, code: str) -> dict:
         handles = list((await self._redis.hgetall(self._room_key(code))).values())
@@ -351,8 +368,8 @@ class RedisRoomManager:
                     continue
                 if channel.startswith(USER_CHANNEL_PREFIX):
                     peer = self._local_users.get(channel.removeprefix(USER_CHANNEL_PREFIX))
-                    if peer is not None:
-                        await self._send_raw(peer, event)
+                    if peer is not None and await self._send_raw(peer, event["event"]):
+                        await self._redis.set(f"{ACK_KEY_PREFIX}{event['nonce']}", 1, ex=ACK_TTL_SECONDS)
                     continue
                 code = channel.removeprefix(CHANNEL_PREFIX)
                 if event.get("type") == "_evict":
