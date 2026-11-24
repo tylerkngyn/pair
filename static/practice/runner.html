@@ -1,0 +1,58 @@
+<!doctype html><meta charset="utf-8"><title>Isolated Python runtime</title>
+<script>
+'use strict';
+// Opaque-origin iframe and network-disabled worker. All Python assets arrive
+// as bytes; no account cookies, API tokens, or network access are provided.
+let port, worker;
+window.addEventListener('message', event => {
+  if (event.source !== parent || event.data !== 'pair-connect' || port || !event.ports[0]) return;
+  port = event.ports[0];
+  port.onmessage = ({data}) => {
+    if (data.type === 'stop') { worker?.terminate(); worker = null; return; }
+    if (data.type !== 'run' || worker) return;
+    const script = `
+      self.addEventListener('unhandledrejection', event => {
+        event.preventDefault();
+        self.postMessage({type:'error', message:String(event.reason).slice(0,3000)});
+      });
+      self.onmessage = async ({data}) => {
+        try {
+          self.postMessage({type:'loading'});
+          const base = 'https://pair-runtime.invalid/';
+          const assets = data.assets;
+          // Pyodide's binary/stdlib loader uses fetch. Resolve only the exact
+          // bundled files in memory; CSP also blocks all real network requests.
+          self.fetch = async input => {
+            const address = input instanceof Request ? input.url : String(input);
+            const name = address?.startsWith(base) ? address.slice(base.length) : null;
+            if (!name || !Object.hasOwn(assets, name)) throw new Error('Network access is disabled in the Python runner.');
+            return new Response(assets[name], {headers:{'Content-Type':name.endsWith('.wasm') ? 'application/wasm' : 'application/octet-stream'}});
+          };
+          const moduleURL = name => URL.createObjectURL(new Blob([assets[name]], {type:'text/javascript'}));
+          const loaderURL = moduleURL('pyodide.mjs'), coreURL = moduleURL('pyodide.asm.mjs');
+          let py;
+          try {
+            const {loadPyodide} = await import(loaderURL);
+            const {default:createPyodideModule} = await import(coreURL);
+            py = await loadPyodide({indexURL:base, createPyodideModule, lockFileContents:JSON.parse(new TextDecoder().decode(assets['pyodide-lock.json']))});
+          } finally { URL.revokeObjectURL(loaderURL); URL.revokeObjectURL(coreURL); }
+          py.runPython(data.harness);
+          py.globals.set('_pair_problem', JSON.stringify(data.problem));
+          py.globals.set('_pair_source', data.code);
+          py.globals.set('_pair_full', data.full);
+          self.postMessage({type:'running'});
+          const result = py.runPython('json.dumps(evaluate(json.loads(_pair_problem), _pair_source, _pair_full))');
+          self.postMessage({type:'result', result:JSON.parse(result)});
+        } catch (error) { self.postMessage({type:'error', message:String(error).slice(0,3000)}); }
+      };`;
+    const url = URL.createObjectURL(new Blob([script], {type:'text/javascript'}));
+    worker = new Worker(url);
+    worker.onmessage = event => { URL.revokeObjectURL(url); port.postMessage(event.data); };
+    worker.onerror = event => port.postMessage({type:'error', message:event.message || 'Python runtime could not load.'});
+    worker.postMessage(data);
+  };
+  port.start();
+  port.postMessage({type:'ready', version:'bundled-v2'});
+});
+parent.postMessage('pair-runner-ready:bundled-v2', '*');
+</script>

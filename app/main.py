@@ -7,10 +7,13 @@ from pathlib import Path
 from anyio import CancelScope
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
 from app.models import ChatEvent, JoinEvent, ReactionEvent, TypingEvent, client_event_adapter
 from app.room_manager import RoomManager
+from app.practice.database import Database
+from app.practice.routes import router as practice_router
 
 INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 MAX_FRAME_CHARS = 8192
@@ -19,15 +22,44 @@ MAX_FRAME_CHARS = 8192
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.rooms = RoomManager()
-    yield
+    app.state.database = Database()
+    try:
+        yield
+    finally:
+        app.state.database.close()
 
 
-app = FastAPI(title="Pair / room chat", lifespan=lifespan)
+app = FastAPI(title="Pair / interview practice", lifespan=lifespan)
+app.include_router(practice_router)
+app.mount("/assets", StaticFiles(directory=INDEX.parent / "practice"), name="assets")
+
+
+@app.middleware("http")
+async def security_headers(request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "same-origin"
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    if request.url.path.startswith("/assets/runtime/314.0.8/"):
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    elif request.url.path in ("/", "/assets/app.js", "/assets/runtime-loader.js", "/assets/runner.html", "/assets/harness.py"):
+        response.headers["Cache-Control"] = "no-cache"
+    if request.url.path == "/assets/runner.html":
+        response.headers["Content-Security-Policy"] = "default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' blob:; worker-src blob:; connect-src 'none'; frame-ancestors 'self'; sandbox allow-scripts"
+    elif request.url.path == "/":
+        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+    return response
 
 
 @app.get("/", response_class=FileResponse)
 async def index():
     return FileResponse(INDEX)
+
+
+@app.get("/chat", response_class=FileResponse)
+async def legacy_chat():
+    return FileResponse(INDEX.with_name("chat.html"))
 
 
 @app.get("/health")
