@@ -32,10 +32,12 @@ async def lifespan(app: FastAPI):
     # the Obsidian plan's "Distributed backend for ranked mode" section.
     redis_url = os.environ.get("REDIS_URL")
     if redis_url:
+        from app.practice.redis_ranked_queue import RedisRankedQueue
         from app.redis_room_manager import RedisRoomManager
         manager = RedisRoomManager(redis_url)
         await manager.start()
         app.state.rooms = manager
+        app.state.ranked_queue = RedisRankedQueue(redis_url)
         try:
             yield
         finally:

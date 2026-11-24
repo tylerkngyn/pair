@@ -258,7 +258,26 @@ Implemented in `app/practice/database.py`: `Rating`, `RankedMatch`, `RankedParti
 
 ### Finalization
 
-Lazy, not event-driven: `GET /api/ranked/matches/{id}` checks `status == "active" and time.time() > deadline` on every read and runs the Elo update + both `Rating` writes in the same transaction if so, then flips `status` to `"completed"`. The status-guard read-then-write is single-process-safe for Phase 1; the Obsidian plan's Phase 2 section covers the additional Redis finalization lock needed once two workers can race this.
+Lazy, not event-driven: `GET /api/ranked/matches/{id}` checks `status == "active" and time.time() > deadline` on every read and runs the Elo update + both `Rating` writes in the same transaction if so, then flips `status` to `"completed"`. The status-guard read-then-write is single-process-safe for Phase 1; the Obsidian plan's Phase 2 section covers the additional Redis finalization lock still needed once two workers can race this — not yet built; see "Phase 2: distributed matchmaking" below for what has.
+
+### Phase 2: distributed matchmaking — implemented
+
+`app/practice/redis_ranked_queue.py`'s `RedisRankedQueue` replaces the Phase 1 in-process `_QUEUE`/`_PENDING_MATCH` globals once more than one worker needs to see the same waiting players — the same problem `app/redis_room_manager.py` already solves for chat/ranked rooms, applied to matchmaking instead of room membership.
+
+**Data model**, one ZSET + one meta hash per distinct filter combination (matching only ever considers identical filters, same as Phase 1):
+- `rq:<filters_hash>` — ZSET, member = `user_id`, score = `rating`.
+- `rq_meta:<user_id>` — HASH: `username`, `rating`, `filters` (json), `queued_at`, `filters_hash`. Presence alone means "this account is queued" — there's no separate index.
+- `rq_pending:<user_id>` — a short-lived (`PENDING_TTL_SECONDS`, default 300s) `MATCH_FOUND` mailbox, the Redis analog of the in-process `_PENDING_MATCH` dict. Needed because the side that was already waiting when someone else's request matches it has no other way to learn the match_id if the WebSocket push doesn't confirm delivery.
+
+**Matching runs in two Lua scripts**, for the same reason `app/redis_room_manager.py`'s `_JOIN_SCRIPT` does — two workers racing the same pair of requests must not both claim the same match:
+- The join script: checks the account isn't already queued, scans the filter group's ZSET for a candidate within the rating window (widened by *the candidate's own wait*, so a fresh arrival can immediately match a long-waiting candidate), and either returns that match (removing the candidate) or adds itself to the queue.
+- The poll script: the Redis equivalent of `GET /api/ranked/queue`'s opportunistic widen-and-retry. Widens based on **whichever side has waited longer** (`min()` of both `queued_at` values) rather than just the candidate's wait, since the polling account's own long wait should count too.
+
+**Wiring**: `app/main.py`'s lifespan sets `app.state.ranked_queue = RedisRankedQueue(redis_url)` alongside `app.state.rooms` behind the same `REDIS_URL` switch. `ranked_routes.py`'s three queue endpoints branch on `getattr(request.app.state, "ranked_queue", None)` — `None` (the default) keeps the exact Phase 1 in-process behavior; set, it routes through the Redis path instead. Match creation and finalization (`_create_match`, `_finalize_if_ready`) are unchanged either way — they only ever see plain dicts, never which backend produced them.
+
+**A real bug found and fixed while building this**: the in-process `_find_opponent`'s window-widening used `max(candidate_queued_at, incoming_queued_at)` — the *more recent* of the two timestamps, which gives the smaller elapsed time and the narrowest possible window. That's backwards from the stated intent ("a fresh arrival can still immediately match a long-waiting candidate"); it should be `min()`, using whichever side waited longer. Existing tests didn't catch it because both compared timestamps happened to be backdated by the same amount. Fixed with a regression test asserting the asymmetric case (one side old, one side fresh) explicitly, and replicated correctly (`min()`) in the Redis poll script above.
+
+**Not yet built** (the remaining Phase 2 checklist items): the stale-queue-entry sweep (a crashed/vanished client's `rq_meta`/`rq`/`rq_pending` entries rely on `ENTRY_TTL_SECONDS`/`PENDING_TTL_SECONDS` as a safety net only, with no active sweep yet, unlike the room manager's reap loop), the per-match finalization lock, and the two-worker load test for the double-finalize race.
 
 ## Verification and remaining work
 

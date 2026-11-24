@@ -1,13 +1,24 @@
 """Ranked 1v1 matchmaking and match orchestration.
 
-Phase 1: a plain in-process queue (per the build checklist's "don't
-over-build it now" — this gets replaced by the Redis sorted-set queue in
-Phase 2). Matching happens synchronously inside POST /api/ranked/queue
-against anyone already waiting. MATCH_FOUND/OPPONENT_PROGRESS/MATCH_RESULT
-push over app.state.rooms's per-account delivery (RoomManager.send_to_user /
-RedisRoomManager.send_to_user); GET /api/ranked/queue polling stays as a
-fallback for a client whose socket was never identified (no valid cookie
-at connect time, or no socket open at all).
+Two matchmaking backends, chosen per request via request.app.state.ranked_queue
+(set in app/main.py's lifespan exactly like app.state.rooms is, behind the
+same REDIS_URL switch):
+
+- Default: the Phase 1 in-process queue below (_QUEUE/_PENDING_MATCH, a
+  plain list/dict behind a threading.Lock). Single-process only — two
+  workers each have their own copy and can never match each other's
+  waiting players.
+- Phase 2: app/practice/redis_ranked_queue.py's RedisRankedQueue, shared
+  state in Redis with the actual matching logic in Lua scripts (same
+  reason app/redis_room_manager.py's room joins use one) so two workers
+  racing the same pair of requests can't both claim the same match.
+
+Match creation and finalization (_create_match, _finalize_if_ready) are
+backend-agnostic — they only ever see plain dicts/DB rows, never the queue
+implementation. MATCH_FOUND/OPPONENT_PROGRESS/MATCH_RESULT push over
+app.state.rooms's per-account delivery (RoomManager.send_to_user /
+RedisRoomManager.send_to_user) either way; GET /api/ranked/queue polling
+stays as a fallback for a client whose socket was never identified.
 """
 import random
 import secrets
@@ -136,47 +147,64 @@ def _find_opponent(incoming: dict):
     ), None)
 
 
-async def _match_and_push(request: Request, waiting: dict, incoming: dict, db):
-    """Creates the match (caller holds _LOCK and an open transaction on
-    `db`) and returns the info needed to push MATCH_FOUND once that
-    transaction has committed and the lock is released.
-
-    Removes both sides from _QUEUE by identity, not equality — `incoming`
-    is sometimes a brand-new entry that was never queued (join_queue's own
-    arrival) and sometimes an already-queued entry re-matching on a poll
-    (queue_status), so both sides need an unconditional, identity-based
-    removal rather than assuming only one of them is actually in _QUEUE.
+def _redis_queue(request: Request):
+    """None by default (Phase 1, in-process); set in app/main.py's
+    lifespan alongside app.state.rooms when REDIS_URL is configured.
     """
-    _QUEUE[:] = [e for e in _QUEUE if e is not waiting and e is not incoming]
-    match = _create_match(db, waiting, incoming)
-    _PENDING_MATCH[waiting["user_id"]] = match.id
-    _PENDING_MATCH[incoming["user_id"]] = match.id
+    return getattr(request.app.state, "ranked_queue", None)
+
+
+def _match_info(match: RankedMatch) -> dict:
     return {
         "match_id": match.id, "deadline": match.deadline,
         "problems": [MatchFoundProblem(id=pid, title=PROBLEMS[pid]["title"]) for pid in match.problem_ids],
     }
 
 
-async def _push_match_found(request: Request, match_info: dict, a: dict, b: dict):
-    # Pushed outside both the lock and the transaction: a dropped/slow
-    # delivery should never hold either. _PENDING_MATCH is purely the
-    # GET /api/ranked/queue poll fallback's mailbox at this point (the DB
-    # is what guards against re-queueing, via _has_active_match above), so
-    # a *confirmed* local delivery can safely drop it right away instead of
-    # leaving a stale notification for a poll that will never need it.
+async def _match_and_push(request: Request, waiting: dict, incoming: dict, db):
+    """In-process path only. Removes both sides from _QUEUE by identity,
+    not equality — `incoming` is sometimes a brand-new entry that was
+    never queued (join_queue's own arrival) and sometimes an
+    already-queued entry re-matching on a poll (queue_status), so both
+    sides need an unconditional, identity-based removal rather than
+    assuming only one of them is actually in _QUEUE.
+    """
+    _QUEUE[:] = [e for e in _QUEUE if e is not waiting and e is not incoming]
+    match = _create_match(db, waiting, incoming)
+    _PENDING_MATCH[waiting["user_id"]] = match.id
+    _PENDING_MATCH[incoming["user_id"]] = match.id
+    return _match_info(match)
+
+
+async def _push_match_found(request: Request, match_info: dict, a: dict, b: dict, redis_queue=None):
+    # Pushed outside both the lock/queue-backend call and the DB
+    # transaction: a dropped/slow delivery should never hold either. The
+    # pending-match mailbox (whichever backend's) is popped only on a
+    # *confirmed* delivery, so an unconfirmed push leaves it for the poll
+    # fallback instead of losing the notification.
     for side, opponent in ((a, b), (b, a)):
         delivered = await request.app.state.rooms.send_to_user(side["user_id"], MatchFoundEvent(payload=MatchFoundPayload(
             match_id=match_info["match_id"], opponent=opponent["username"], opponent_rating=opponent["rating"],
             deadline=match_info["deadline"], problems=match_info["problems"],
         )))
         if delivered:
-            with _LOCK:
-                _PENDING_MATCH.pop(side["user_id"], None)
+            if redis_queue is not None:
+                await redis_queue.pop_pending(side["user_id"])
+            else:
+                with _LOCK:
+                    _PENDING_MATCH.pop(side["user_id"], None)
 
 
 @router.post("/queue", status_code=202)
 async def join_queue(filters: QueueFilters, request: Request, identity=Depends(auth.authenticated_write)):
     user = identity[0]
+    redis_queue = _redis_queue(request)
+    if redis_queue is not None:
+        return await _join_redis(request, redis_queue, user, filters)
+    return await _join_in_process(request, user, filters)
+
+
+async def _join_in_process(request: Request, user, filters: QueueFilters):
     match_info = None
     opponent_entry = None
     incoming = None
@@ -200,9 +228,39 @@ async def join_queue(filters: QueueFilters, request: Request, identity=Depends(a
     return {"status": "matched", "match_id": match_info["match_id"]}
 
 
+async def _join_redis(request: Request, redis_queue, user, filters: QueueFilters):
+    with request.app.state.database.session.begin() as db:
+        if _has_active_match(db, user.id):
+            raise HTTPException(409, "Already in an active match")
+        rating_row = _get_or_create_rating(db, user.id)
+        incoming = {
+            "user_id": user.id, "username": user.username, "rating": rating_row.rating,
+            "filters": filters.model_dump(), "queued_at": time.time(),
+        }
+        result = await redis_queue.join(user.id, user.username, rating_row.rating, incoming["filters"])
+        if result["status"] == "already_queued":
+            raise HTTPException(409, "Already queued")
+        if result["status"] == "queued":
+            return {"status": "queued", "queued_at": result["queued_at"]}
+        opponent = result["opponent"]
+        match_info = _match_info(_create_match(db, opponent, incoming))
+    await redis_queue.mark_pending(opponent["user_id"], match_info["match_id"])
+    await redis_queue.mark_pending(user.id, match_info["match_id"])
+    await _push_match_found(request, match_info, incoming, opponent, redis_queue)
+    return {"status": "matched", "match_id": match_info["match_id"]}
+
+
 @router.delete("/queue")
-def leave_queue(request: Request, identity=Depends(auth.authenticated_write)):
+async def leave_queue(request: Request, identity=Depends(auth.authenticated_write)):
     user_id = identity[0].id
+    redis_queue = _redis_queue(request)
+    if redis_queue is not None:
+        with request.app.state.database.session() as db:
+            if _has_active_match(db, user_id):
+                raise HTTPException(409, "Already matched")
+        if not await redis_queue.leave(user_id):
+            raise HTTPException(404, "Not in queue")
+        return {"status": "left"}
     with _LOCK:
         with request.app.state.database.session() as db:
             if _has_active_match(db, user_id):
@@ -217,6 +275,13 @@ def leave_queue(request: Request, identity=Depends(auth.authenticated_write)):
 @router.get("/queue")
 async def queue_status(request: Request, identity=Depends(auth.current_login)):
     user_id = identity[0].id
+    redis_queue = _redis_queue(request)
+    if redis_queue is not None:
+        return await _poll_redis(request, redis_queue, user_id)
+    return await _poll_in_process(request, user_id)
+
+
+async def _poll_in_process(request: Request, user_id: str):
     match_info = None
     mine = None
     opponent_entry = None
@@ -239,6 +304,24 @@ async def queue_status(request: Request, identity=Depends(auth.current_login)):
         with request.app.state.database.session.begin() as db:
             match_info = await _match_and_push(request, opponent_entry, mine, db)
     await _push_match_found(request, match_info, mine, opponent_entry)
+    return {"status": "matched", "match_id": match_info["match_id"]}
+
+
+async def _poll_redis(request: Request, redis_queue, user_id: str):
+    result = await redis_queue.poll(user_id)
+    if result["status"] in ("idle", "queued"):
+        return result
+    if "match_id" in result:  # Pending-mailbox hit; a match already exists.
+        return result
+    # The poll itself just found a match via widening — same as join()'s
+    # match case, except the "incoming" side (this account) came from the
+    # script's own "mine" field rather than being freshly built here.
+    opponent, mine = result["opponent"], result["mine"]
+    with request.app.state.database.session.begin() as db:
+        match_info = _match_info(_create_match(db, opponent, mine))
+    await redis_queue.mark_pending(opponent["user_id"], match_info["match_id"])
+    await redis_queue.mark_pending(user_id, match_info["match_id"])
+    await _push_match_found(request, match_info, mine, opponent, redis_queue)
     return {"status": "matched", "match_id": match_info["match_id"]}
 
 
