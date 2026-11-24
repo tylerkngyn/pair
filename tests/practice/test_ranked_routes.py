@@ -317,3 +317,26 @@ def test_queue_widens_and_matches_on_poll_not_just_on_arrival(client):
 
     as_(client, bob)
     assert client.get("/api/ranked/queue").json() == {"status": "matched", "match_id": match_id}
+
+
+def test_fresh_arrival_matches_a_long_waiting_candidate_outside_base_window(client):
+    """A fresh arrival's own window should widen based on how long the
+    OTHER, already-queued side has waited, not shrink back to the base
+    case just because the arriving side's own wait is zero. Regression
+    test for a bug where the window used max(both queued_at) - the more
+    recent of the two timestamps - instead of min(), which silently
+    discarded a long-waiting candidate's widened window on every fresh
+    arrival.
+    """
+    alice = register(client, "alice")
+    as_(client, alice)
+    client.post("/api/ranked/queue", json=FILTERS)
+    # Outside the base ±50 window; only alice's long wait (backdated below)
+    # should widen things enough to bridge this 200-point gap.
+    ranked_routes._QUEUE[0]["rating"] = 1200
+    ranked_routes._QUEUE[0]["queued_at"] -= 100  # alice has waited a long time; bob has not.
+
+    bob = register(client, "bob")
+    as_(client, bob)
+    matched = client.post("/api/ranked/queue", json=FILTERS)
+    assert matched.json()["status"] == "matched"

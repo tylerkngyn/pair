@@ -124,7 +124,15 @@ def _find_opponent(incoming: dict):
         candidate for candidate in _QUEUE
         if candidate["user_id"] != incoming["user_id"]
         and candidate["filters"] == incoming["filters"]
-        and abs(candidate["rating"] - incoming["rating"]) <= _widen(time.time() - max(candidate["queued_at"], incoming["queued_at"]))
+        # min(), not max(): the window should widen based on whichever side
+        # has waited LONGER (the older/smaller timestamp), which gives the
+        # larger elapsed time. Using max() picked the more-recently-queued
+        # side instead, which shrank the window back toward the base case
+        # on every fresh arrival regardless of how long the other side had
+        # actually been waiting — the opposite of the "courtesy" described
+        # above, just masked in testing by both sides usually being equally
+        # fresh or equally backdated.
+        and abs(candidate["rating"] - incoming["rating"]) <= _widen(time.time() - min(candidate["queued_at"], incoming["queued_at"]))
     ), None)
 
 
