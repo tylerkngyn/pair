@@ -10,10 +10,12 @@ Python 3.11+ is required. The pinned Pyodide runtime is bundled with the app. Th
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+uvicorn app.main:app --reload --reload-dir app --reload-dir static --host 127.0.0.1 --port 8000
 ```
 
 Open <http://127.0.0.1:8000>, create a username/password account, and start practice. Accounts, drafts, login sessions, and history live in `var/pair.db`, ignored by Git. Username accounts do not currently support password recovery or email verification.
+
+Pin `--reload-dir` to `app`/`static` rather than letting `--reload` watch the whole working directory (its default): unscoped, it also watches `var/pair.db`, and the file gets rewritten on every request that touches the database — a login, a queue join, a submission — which restarts the whole worker mid-session. That's silent and easy to misdiagnose as a backend bug (ranked mode's in-process matchmaking queue, in particular, is wiped by any such restart, since it's a plain in-memory list with no Phase 1 persistence by design).
 
 For another device on your network, use `uvicorn app.main:app --host 0.0.0.0 --port 8000` and open `http://<computer-LAN-IP>:8000`. Each device runs its own Python interpreter in its browser. Multiplayer interview sessions are not implemented.
 
