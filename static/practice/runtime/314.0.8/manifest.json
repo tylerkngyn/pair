@@ -1,0 +1,31 @@
+{
+  "version": "314.0.8",
+  "source": "https://registry.npmjs.org/pyodide/-/pyodide-314.0.8.tgz",
+  "files": [
+    {
+      "name": "pyodide.mjs",
+      "bytes": 17758,
+      "sha256": "1bb8cc14f9405aaa7cd4e00c12edd0a8539de9cc026618d6ee5a9663f367dc70"
+    },
+    {
+      "name": "pyodide.asm.mjs",
+      "bytes": 1250259,
+      "sha256": "22514b8be6980e28a02c8b1d6387ce8dfe666fc4edf8d547cff5dce29ff4d972"
+    },
+    {
+      "name": "pyodide.asm.wasm",
+      "bytes": 9597892,
+      "sha256": "e14d49ceca9b4a0e274ea918f3a898de2d3880b6e5573a6cfe1a2267ecc70329"
+    },
+    {
+      "name": "python_stdlib.zip",
+      "bytes": 2545550,
+      "sha256": "2bd3394a145bfbbe5bbc9d9d6ab9136abbb986c6fef6c142b3a2962227aa5c28"
+    },
+    {
+      "name": "pyodide-lock.json",
+      "bytes": 119077,
+      "sha256": "5dc2fc119108bc148c7457dc86e7675b5c87e1cafd420b9c34c1eaef7b36c010"
+    }
+  ]
+}

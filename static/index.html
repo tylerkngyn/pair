@@ -1,349 +1,37 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#1c1c1c">
-  <title>Pair</title>
-  <script>
-    // Apply a saved preference before the page paints.
-    try {
-      if (localStorage.getItem('pair-theme') === 'light') {
-        document.documentElement.dataset.theme = 'light';
-        document.querySelector('meta[name="theme-color"]').content = '#e9e9e9';
-      }
-    } catch { /* Theme switching also works when storage is unavailable. */ }
-  </script>
-  <style>
-    :root {
-      color-scheme:dark;
-      --bg:#1c1c1c; --field:#202020; --line:#3b3b3b; --control-line:#6b6b6b;
-      --text:#c9c9c9; --muted:#9a9a9a; --sender:#b5b5b5;
-      --hover:#292929; --primary:#b5b5b5; --primary-text:#202020; --primary-hover:#c2c2c2;
-      --message-line:#646464; --focus:#a3a3a3; --selection:#444;
-      font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;
-    }
-    :root[data-theme="light"] {
-      color-scheme:light;
-      --bg:#e9e9e9; --field:#e5e5e5; --line:#c5c5c5; --control-line:#808080;
-      --text:#454545; --muted:#666; --sender:#555;
-      --hover:#dedede; --primary:#565656; --primary-text:#ededed; --primary-hover:#484848;
-      --message-line:#8a8a8a; --focus:#707070; --selection:#c7c7c7;
-    }
-    * { box-sizing:border-box; }
-    [hidden] { display:none !important; }
-    ::selection { background:var(--selection); color:var(--text); }
-    body { margin:0; min-height:100dvh; background:var(--bg); color:var(--text); font-size:16px; line-height:1.5; }
-    header { display:flex; align-items:center; justify-content:space-between; padding:28px 32px; }
-    .brand { font-size:21px; font-weight:700; letter-spacing:-1px; }
-    #theme-toggle { padding:5px 8px; border:0; color:var(--muted); font-size:14px; }
-    main { width:min(100% - 48px,720px); margin:clamp(48px,16vh,160px) auto 32px; }
-    #join-view { width:min(100%,320px); margin:0 auto; }
-    button,input,textarea { font:inherit; border:1px solid var(--control-line); border-radius:3px; }
-    button { padding:11px 16px; background:transparent; color:var(--text); cursor:pointer; }
-    button:hover:enabled { background:var(--hover); }
-    button:disabled { opacity:.45; cursor:not-allowed; }
-    :focus-visible { outline:2px solid var(--focus); outline-offset:3px; }
-    input,textarea { width:100%; background:var(--field); color:var(--text); padding:13px 14px; }
-    input::placeholder,textarea::placeholder { color:var(--muted); opacity:1; }
-    .primary { background:var(--primary); border-color:var(--primary); color:var(--primary-text); }
-    .primary:hover:enabled { background:var(--primary-hover); border-color:var(--primary-hover); }
-    .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip-path:inset(50%); white-space:nowrap; border:0; }
-    #join-form { display:grid; gap:12px; }
-    #room-code { text-transform:uppercase; }
-    .alert { max-width:320px; margin:0 auto 24px; color:var(--text); font-size:14px; overflow-wrap:anywhere; }
-    .panel-top { display:flex; align-items:center; justify-content:space-between; gap:16px; padding-bottom:16px; border-bottom:1px solid var(--line); }
-    .room-id { margin:0; font-size:18px; font-weight:500; letter-spacing:2px; }
-    #leave { padding:7px 11px; font-size:14px; }
-    .room-meta { display:flex; justify-content:flex-end; padding:12px 0; color:var(--muted); font-size:14px; }
-    #peers { overflow-wrap:anywhere; min-width:0; }
-    #messages { height:clamp(220px,40dvh,460px); overflow-y:auto; padding:4px 0 16px; scrollbar-color:var(--message-line) transparent; }
-    .system { color:var(--muted); font-size:13px; margin:12px 0; overflow-wrap:anywhere; }
-    .message { margin:20px 0; padding-left:12px; border-left:2px solid var(--message-line); }
-    .message.mine { border-left-color:var(--text); }
-    .message-head { display:flex; flex-wrap:wrap; gap:12px; align-items:baseline; color:var(--muted); font-size:13px; }
-    .sender { color:var(--sender); font-size:14px; overflow-wrap:anywhere; }
-    .mine .sender { color:var(--text); }
-    .message p { margin:4px 0 0; white-space:pre-wrap; overflow-wrap:anywhere; }
-    .composer { padding-top:16px; border-top:1px solid var(--line); }
-    .composer-row { display:flex; gap:10px; align-items:stretch; }
-    textarea { resize:vertical; min-height:52px; max-height:180px; line-height:1.5; }
-    .composer-meta { text-align:right; margin-top:8px; color:var(--muted); font-size:12px; }
-    #count.over { color:var(--text); font-weight:700; }
-    #typing-indicator { margin:0 0 4px; min-height:1.3em; }
-    #reaction-bar { display:flex; gap:6px; padding-bottom:12px; }
-    #reaction-bar button { padding:6px 10px; font-size:17px; line-height:1; }
-    .reaction-fly { position:fixed; left:50%; bottom:20%; font-size:28px; pointer-events:none; animation:float-up 1.4s ease-out forwards; z-index:10; }
-    @keyframes float-up { 0% { transform:translate(-50%,0) scale(.6); opacity:0; } 15% { transform:translate(-50%,-10px) scale(1); opacity:1; } 100% { transform:translate(-50%,-180px) scale(1); opacity:0; } }
-    @media(max-width:480px) { header { padding:22px 24px; } main { margin-top:64px; } .room-meta { font-size:13px; } }
-  </style>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#191919">
+  <title>Pair — practice</title><link rel="stylesheet" href="/assets/styles.css"><script src="/assets/runtime-loader.js?rev=bundled-v2" defer></script><script src="/assets/app.js?rev=bundled-v2" defer></script>
 </head>
 <body>
-  <header><div class="brand">pair://</div><button id="theme-toggle" type="button" aria-label="Switch to light mode">Light</button></header>
+  <header><a class="brand" href="/">pair://</a><nav aria-label="Account"><span id="username"></span><button id="theme" type="button">Light</button><button id="signout" type="button" hidden>Sign out</button></nav></header>
+  <div id="notice" role="status" hidden></div>
   <main>
-    <div id="alert" class="alert" role="alert" hidden></div>
-    <section id="join-view" aria-label="Join room">
-      <form id="join-form">
-        <label class="sr-only" for="handle">Name</label>
-        <input id="handle" name="handle" maxlength="32" placeholder="Name" autocomplete="nickname">
-        <label class="sr-only" for="room-code">Room code</label>
-        <input id="room-code" name="room" minlength="6" maxlength="6" pattern="[A-Za-z0-9]{6}" placeholder="Room code" title="6 letters or numbers" required autocomplete="off" autocapitalize="characters" spellcheck="false">
-        <button id="join-button" class="primary" type="submit">Join room</button>
-      </form>
+    <section id="account" class="narrow" hidden>
+      <h1>Time to practice.</h1>
+      <div class="tabs"><button id="login-tab" class="selected" type="button">Sign in</button><button id="register-tab" type="button">Create account</button></div>
+      <form id="account-form" class="stack"><label>Username<input id="account-name" autocomplete="username" minlength="3" maxlength="32" pattern="[A-Za-z0-9_]{3,32}" required></label><label>Password<input id="password" type="password" autocomplete="current-password" minlength="10" maxlength="128" required></label><small>At least 10 characters. Accounts use usernames; password recovery is not available yet.</small><button id="account-submit" class="primary">Sign in</button></form>
     </section>
-    <section id="chat-view" aria-label="Room chat" hidden>
-      <div class="panel-top"><h1 id="active-room" class="room-id"></h1><button id="leave" type="button">Leave room</button></div>
-      <div class="room-meta"><span id="peers" role="status" aria-label="Room capacity"></span></div>
-      <div id="messages" role="log" aria-label="Room messages" aria-live="polite" aria-relevant="additions text"></div>
-      <p id="typing-indicator" class="system" aria-live="polite" hidden></p>
-      <div id="reaction-bar" role="group" aria-label="Send a reaction"></div>
-      <form id="chat-form" class="composer">
-        <label class="sr-only" for="message">Message</label>
-        <div class="composer-row"><textarea id="message" rows="1" placeholder="Message" disabled></textarea><button id="send" class="primary" type="submit" disabled>Send</button></div>
-        <div class="composer-meta"><span id="count">0 / 500</span></div>
+    <section id="setup" hidden>
+      <div class="section-heading"><div><h1>Your next interview.</h1><p>Python · NeetCode 150 · your pace</p></div></div>
+      <form id="setup-form" class="setup-grid">
+        <div class="stack"><label>Topic<select id="category"><option value="">All topics</option></select></label><div class="two-columns"><label>Difficulty<select id="difficulty"><option value="mixed">Mixed</option><option value="easy">Easy</option><option value="medium">Medium</option><option value="hard">Hard</option></select></label><label>Problems<input id="problem-count" type="number" min="1" max="5" value="1" required></label></div><label>Session time · minutes<input id="duration" type="number" min="5" max="180" value="45" required></label><label class="check"><input id="overtime" type="checkbox" checked>Allow overtime</label><button id="start" class="primary">Start practice</button><small id="matching"></small></div>
+        <div class="problem-picker"><div class="picker-heading"><span>Choose problems</span><button id="randomize" type="button">Random</button></div><input id="search" type="search" placeholder="Search the 150 problems" aria-label="Search problems"><p class="hint">Leave unselected for a random session.</p><div id="problem-list"></div></div>
       </form>
+      <section class="history"><h2>Recent sessions</h2><div id="history"></div></section>
     </section>
+    <section id="workspace" hidden>
+      <div class="workspace-bar"><div id="problem-tabs" class="tabs" role="group" aria-label="Session problems"></div><div class="session-controls"><span id="timer" role="timer">45:00</span><button id="finish" type="button">Finish session</button></div></div>
+      <div class="workspace-grid">
+        <article class="problem-panel"><div id="problem-meta" class="eyebrow"></div><h1 id="problem-title"></h1><p id="prompt"></p><h2>Examples</h2><div id="examples"></div><p class="hint">Standard Python typing, collections, heapq, math, and node helpers are available. Match the starter interface.</p><a id="problem-link" target="_blank" rel="noopener noreferrer">Problem reference ↗</a></article>
+        <div class="coding-panel"><div class="editor-bar"><span>Python</span><span id="save-state" role="status">Saved</span><button id="reset" type="button">Reset code</button></div><div class="editor-shell"><pre id="line-numbers" aria-hidden="true">1</pre><textarea id="editor" aria-label="Python code editor" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off" wrap="off"></textarea></div><div class="run-bar"><span id="execution-state" role="status">Python loads on first run.</span><div><button id="stop" type="button" hidden>Stop</button><button id="run" type="button">Run examples</button><button id="submit" class="primary" type="button">Submit</button></div></div><section id="results" aria-label="Execution results" aria-live="polite"><p class="hint">Run examples to inspect output. Submit checks the full practice suite.</p></section></div>
+      </div>
+      <p class="practice-note">Browser-based practice · tests are inspectable · timings are device-local, not a complexity grade.</p>
+    </section>
+    <section id="summary" class="narrow wide" hidden><p class="eyebrow">Session complete</p><h1 id="summary-score"></h1><p id="summary-time"></p><div id="summary-problems"></div><button id="again" class="primary" type="button">New session</button><p class="hint">Correctness is the percentage of this session’s practice tests passed. Efficiency compares repeated invocation timings with a reference on this device. Results are browser-reported.</p></section>
   </main>
-  <script>
-    'use strict';
-    const $ = id => document.getElementById(id);
-    let socket = null;
-    let heartbeat = null;
-    let connectTimeout = null;
-    let joined = false;
-    let selfHandle = '';
-
-    function updateThemeButton() {
-      const light = document.documentElement.dataset.theme === 'light';
-      $('theme-toggle').textContent = light ? 'Dark' : 'Light';
-      $('theme-toggle').setAttribute('aria-label', `Switch to ${light ? 'dark' : 'light'} mode`);
-    }
-    updateThemeButton();
-    $('theme-toggle').addEventListener('click', () => {
-      const theme = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
-      document.documentElement.dataset.theme = theme;
-      document.querySelector('meta[name="theme-color"]').content = getComputedStyle(document.documentElement).getPropertyValue('--bg').trim();
-      try { localStorage.setItem('pair-theme', theme); } catch { /* Optional persistence. */ }
-      updateThemeButton();
-    });
-    let typingTimeout = null;
-    let sentTyping = false;
-    let peerTypingTimeout = null;
-    const REACTIONS = ['👍', '❤️', '😂', '😮', '👏'];
-    for (const emoji of REACTIONS) {
-      const button = document.createElement('button');
-      button.type = 'button';
-      button.textContent = emoji;
-      button.setAttribute('aria-label', `Send ${emoji} reaction`);
-      button.addEventListener('click', () => {
-        if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({type:'reaction', payload:{emoji}}));
-      });
-      $('reaction-bar').appendChild(button);
-    }
-    function flyReaction(emoji) {
-      const span = document.createElement('span');
-      span.className = 'reaction-fly';
-      span.textContent = emoji;
-      span.style.left = `${40 + Math.random() * 20}%`;
-      document.body.appendChild(span);
-      span.addEventListener('animationend', () => span.remove());
-    }
-    function setPeerTyping(sender, isTyping) {
-      clearTimeout(peerTypingTimeout);
-      if (isTyping) {
-        $('typing-indicator').textContent = `${sender} is typing…`;
-        $('typing-indicator').hidden = false;
-        peerTypingTimeout = setTimeout(() => { $('typing-indicator').hidden = true; }, 5000);
-      } else {
-        $('typing-indicator').hidden = true;
-      }
-    }
-    function sendTyping(isTyping) {
-      if (socket?.readyState !== WebSocket.OPEN || sentTyping === isTyping) return;
-      sentTyping = isTyping;
-      socket.send(JSON.stringify({type:'typing', payload:{typing:isTyping}}));
-    }
-
-    function randomInt(max) { return crypto.getRandomValues(new Uint32Array(1))[0] % max; }
-    function showError(text) { $('alert').textContent = text; $('alert').hidden = !text; }
-    function setJoining(busy) {
-      $('join-button').disabled = busy;
-      $('handle').disabled = busy;
-      $('room-code').disabled = busy;
-      $('join-button').textContent = busy ? 'Connecting…' : 'Join room';
-    }
-    function updateComposer() {
-      const length = Array.from($('message').value).length;
-      $('count').textContent = `${length} / 500`;
-      $('count').classList.toggle('over', length > 500);
-      $('send').disabled = !joined || socket?.readyState !== WebSocket.OPEN || !$('message').value.trim() || length > 500;
-    }
-    function appendEntry(element) {
-      const log = $('messages');
-      const nearBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 70;
-      log.appendChild(element);
-      // Bound this ephemeral transcript so long sessions do not grow forever.
-      while (log.children.length > 300) log.firstElementChild.remove();
-      if (nearBottom) log.scrollTop = log.scrollHeight;
-    }
-    function systemMessage(text) {
-      const entry = document.createElement('p');
-      entry.className = 'system';
-      entry.textContent = text;
-      appendEntry(entry);
-    }
-    function chatMessage(payload) {
-      const mine = payload.sender === selfHandle;
-      const entry = document.createElement('article');
-      entry.className = `message${mine ? ' mine' : ''}`;
-      const head = document.createElement('div');
-      head.className = 'message-head';
-      const name = document.createElement('span');
-      name.className = 'sender';
-      name.textContent = payload.sender + (mine ? ' (you)' : '');
-      const timestamp = document.createElement('time');
-      const date = new Date(payload.timestamp * 1000);
-      timestamp.dateTime = date.toISOString();
-      timestamp.textContent = date.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
-      timestamp.title = date.toLocaleString();
-      head.append(name, timestamp);
-      const text = document.createElement('p');
-      // Always render user content as text, never as HTML.
-      text.textContent = payload.text;
-      entry.append(head, text);
-      appendEntry(entry);
-    }
-    function applyRoomState(payload) {
-      if (!joined) {
-        joined = true;
-        clearTimeout(connectTimeout);
-        setJoining(false);
-        $('join-view').hidden = true;
-        $('chat-view').hidden = false;
-        $('active-room').textContent = payload.room;
-        $('message').disabled = false;
-        $('message').focus();
-      }
-      $('peers').textContent = `${payload.peers.length}/2`;
-      $('peers').setAttribute('aria-label', `${payload.peers.length} of 2 participants`);
-      updateComposer();
-    }
-    $('room-code').addEventListener('input', () => { $('room-code').value = $('room-code').value.toUpperCase(); });
-    $('join-form').addEventListener('submit', event => {
-      event.preventDefault();
-      if (socket && socket.readyState < WebSocket.CLOSING) return;
-      showError('');
-      selfHandle = $('handle').value.trim() || `Player-${String(randomInt(10000)).padStart(4, '0')}`;
-      const room = $('room-code').value.trim().toUpperCase();
-      sentTyping = false;
-      $('messages').replaceChildren();
-      setPeerTyping('', false);
-      setJoining(true);
-      const scheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const ws = new WebSocket(`${scheme}//${window.location.host}/ws`);
-      socket = ws;
-      connectTimeout = setTimeout(() => {
-        if (socket === ws && !joined) { showError('Connection timed out. Please try again.'); ws.close(); }
-      }, 12000);
-      ws.onopen = () => {
-        if (socket !== ws) return;
-        ws.send(JSON.stringify({type:'join', payload:{room, handle:selfHandle}}));
-        heartbeat = setInterval(() => {
-          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({type:'ping', payload:{}}));
-        }, 20000);
-      };
-      ws.onmessage = event => {
-        if (socket !== ws) return;
-        let data;
-        try { data = JSON.parse(event.data); } catch { showError('Received an invalid server event.'); return; }
-        if (!data || typeof data.payload !== 'object' || data.payload === null) return;
-        switch (data.type) {
-          case 'room_state': applyRoomState(data.payload); break;
-          case 'chat':
-            if (data.payload.sender !== selfHandle) setPeerTyping('', false);
-            chatMessage(data.payload);
-            break;
-          case 'system': systemMessage(data.payload.text); setPeerTyping('', false); break;
-          case 'typing':
-            if (data.payload.sender !== selfHandle) setPeerTyping(data.payload.sender, data.payload.typing);
-            break;
-          case 'reaction':
-            flyReaction(data.payload.emoji);
-            break;
-          case 'error':
-            showError(data.payload.message);
-            if (!joined) ws.close();
-            break;
-        }
-      };
-      ws.onerror = () => { if (socket === ws) showError('Connection error. Check the server and your network.'); };
-      ws.onclose = () => {
-        if (socket !== ws) return;
-        clearInterval(heartbeat); clearTimeout(connectTimeout);
-        socket = null;
-        setJoining(false);
-        sentTyping = false;
-        clearTimeout(typingTimeout);
-        setPeerTyping('', false);
-        if (joined) {
-          joined = false;
-          $('message').disabled = true;
-          $('peers').textContent = 'Disconnected';
-          $('peers').setAttribute('aria-label', 'Disconnected');
-          $('leave').textContent = 'Back to join';
-          systemMessage('Connection closed. Return to join to reconnect.');
-        } else if ($('alert').hidden) showError('Unable to join. Check your connection and try again.');
-        updateComposer();
-      };
-    });
-    $('chat-form').addEventListener('submit', event => {
-      event.preventDefault();
-      updateComposer();
-      if ($('send').disabled) return;
-      try {
-        socket.send(JSON.stringify({type:'chat', payload:{text:$('message').value}}));
-        $('message').value = '';
-        clearTimeout(typingTimeout);
-        sendTyping(false);
-        showError('');
-      } catch { showError('Message could not be sent. Check your connection.'); }
-      updateComposer();
-      $('message').focus();
-    });
-    $('message').addEventListener('input', () => {
-      updateComposer();
-      if ($('message').value.trim()) {
-        sendTyping(true);
-        clearTimeout(typingTimeout);
-        typingTimeout = setTimeout(() => sendTyping(false), 3000);
-      } else {
-        clearTimeout(typingTimeout);
-        sendTyping(false);
-      }
-    });
-    $('message').addEventListener('keydown', event => {
-      if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
-        event.preventDefault();
-        $('chat-form').requestSubmit();
-      }
-    });
-    $('leave').addEventListener('click', () => {
-      const ws = socket;
-      socket = null; joined = false;
-      clearInterval(heartbeat); clearTimeout(connectTimeout); clearTimeout(typingTimeout);
-      sentTyping = false;
-      setPeerTyping('', false);
-      if (ws) ws.close(1000, 'Left room');
-      $('chat-view').hidden = true;
-      $('join-view').hidden = false;
-      $('leave').textContent = 'Leave room';
-      $('message').value = '';
-      $('message').disabled = true;
-      setJoining(false); updateComposer(); showError('');
-      $('messages').replaceChildren();
-      $('room-code').focus();
-    });
-    window.addEventListener('pagehide', () => { socket?.close(1000, 'Page closed'); });
-  </script>
+  <footer>Python practice. <a href="https://github.com/neetcode-gh/leetcode" target="_blank" rel="noopener noreferrer">NeetCode 150 catalog &amp; reference code</a> · <a href="/assets/NEETCODE_LICENSE.txt">MIT license</a></footer>
+  <iframe id="runner-frame" title="Isolated Python runner" sandbox="allow-scripts" hidden></iframe>
 </body>
 </html>

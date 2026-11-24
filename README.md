@@ -1,11 +1,10 @@
-# Pair — two-peer room chat
+# Pair — timed Python interview practice
 
-A text-only FastAPI + native WebSocket MVP with one static HTML/CSS/JS frontend.
-No frontend build, authentication, database, or message history.
+A minimal, grayscale practice workspace built with FastAPI and vanilla HTML/CSS/JavaScript. Create an account, choose NeetCode 150 topics and difficulty, pick 1–5 problems and a 5–180 minute session, then run Python, submit practice tests, and review correctness and execution time.
 
-## Run
+## Run locally
 
-Requires Python 3.11+.
+Python 3.11+ is required. The pinned Pyodide runtime is bundled with the app. The first Run loads about 13 MB from your FastAPI server, with visible progress; later runs reuse those files. No external runtime CDN, paid API, API key, or frontend build is required.
 
 ```sh
 python3 -m venv .venv
@@ -14,348 +13,115 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-Open <http://127.0.0.1:8000>. Choose any six-character alphanumeric room code,
-enter a name (or leave it blank), and join. In a second tab, enter the same code
-and a different name. A new room is created automatically when needed.
-Messages work while waiting, but are delivered only to peers currently present.
-A third peer receives `ROOM_FULL` / `Room is full`, then close code `1008`.
-Leave or refresh either tab; the survivor sees the departure and can pair again.
+Open <http://127.0.0.1:8000>, create a username/password account, and start practice. Accounts, drafts, login sessions, and history live in `var/pair.db`, ignored by Git. Username accounts do not currently support password recovery or email verification.
 
-### Two devices on the same local network
+For another device on your network, use `uvicorn app.main:app --host 0.0.0.0 --port 8000` and open `http://<computer-LAN-IP>:8000`. Each device runs its own Python interpreter in its browser. Multiplayer interview sessions are not implemented.
+
+## Workspace
+
+- Filter the real 150-entry catalog by topic and difficulty. Select particular problems or leave selection empty for random selection. The selected count must match the session's problem count.
+- Python editor with line numbers, Tab indentation, automatic indentation, and Ctrl/Cmd+Enter to run examples. This is a lightweight editor, not a full IDE or language server.
+- **Run examples** checks the first two fixtures without recording a score. **Submit** checks every practice fixture and saves the result with that code version.
+- Autosave writes drafts to the account and keeps a local fallback when storage is available. Revisions reject stale saves from another tab; refresh to resolve a conflict.
+- The timer uses the server's session deadline. Overtime is enabled by default. Disable it to stop editing at expiry; there is no automatic submission. A final unsaved local draft is retained if time runs out.
+- Finish a session to see its report. Resume active sessions or review completed sessions in Recent sessions (latest 30).
+
+## Correctness and efficiency
+
+All 150 problems have original concise prompts, starter interfaces, and at least two independently specified practice fixtures. Larger deterministic cases supplement selected problems. These are **our practice tests**, not LeetCode/NeetCode private judge tests, and passing them does not prove correctness on every valid input or compliance with an algorithmic constraint such as constant space.
+
+Adapters support linked lists, trees, graphs, random pointers, in-place mutation, codec round-trips, and stateful design classes. Comparators accept alternative valid outputs where appropriate, including course orders, alien alphabets, palindrome ties, and unordered collections.
+
+Correctness = passed tests / all tests across the selected session, including unsubmitted problems as zero. Editing a saved solution invalidates its previous result until resubmission.
+
+Efficiency is a separate **device-local runtime comparison**, available after every test passes. The harness times invocation batches (three samples, median per fixture, normalized per invocation) for your implementation and a pinned reference, then sums the fixture timings. Inputs are rebuilt before measurement; source compilation, runtime download, input adaptation, and output serialization are excluded. Object construction and a small invocation-loop overhead are included. Small reference measurements are labeled too small for a stable ratio. This is not Big-O inference, a cross-user percentile, a memory measurement, or a guaranteed optimal baseline.
+
+## Execution boundary
+
+FastAPI **never executes submitted code**. The workspace downloads the bundled runtime through its own origin and caches its bytes. Code runs in a fresh Web Worker inside an opaque-origin iframe (`sandbox="allow-scripts"`, without `allow-same-origin`). Only runtime bytes, the harness, and the exercise/submission are sent into that worker. Runtime module imports use blob URLs and file fetches resolve in memory; CSP denies all real network connections. No account cookie or CSRF token is passed into the runner. A fresh worker is created per run, so globals and mutations do not leak across runs.
+
+The workspace can terminate execution with Stop; a 10-second execution deadline also terminates the worker. Downloading has a 90-second timeout with visible byte progress; opening the iframe has a 10-second timeout, and interpreter startup has a 30-second timeout. Download failures release the controls for retry; Stop also cancels runtime downloads. API and harness requests have 20-second timeouts. Bootstrap scripts and the iframe use versioned URLs and a matching protocol so Chrome cannot combine an old cached CDN runner with the bundled runtime. There is no hard browser-memory quota. Browser-reported tests/timings are inspectable and tamperable, suitable for personal practice rather than trusted assessments or competitive leaderboards. Result validation on the API checks shape/counts, not independent execution. A future trusted judge should implement a separate isolated server-side runner.
+
+## Accounts and database
+
+Passwords use salted scrypt hashes. Login cookies are HttpOnly and SameSite=Strict; only hashes of opaque login tokens are stored. Logins expire after seven days and logout revokes the token. Writes check a CSRF token and request origin. Authentication attempts have database-backed limits. Private API responses use `Cache-Control: no-store`.
+
+The default database is SQLite. To use PostgreSQL, set `DATABASE_URL` before startup:
 
 ```sh
+export DATABASE_URL='postgresql://USER:PASSWORD@HOST/DATABASE?sslmode=require'
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-Find the server computer's LAN IP in network settings (e.g. `192.168.1.20`).
-Open `http://192.168.1.20:8000` on both devices and enter the same code. Allow
-port 8000 through the computer's firewall if prompted. Both devices must be on
-the same network; guest Wi-Fi/client isolation may prevent connections. Browse
-to the actual LAN IP, not `0.0.0.0`. HTTPS automatically uses `wss://`; an HTTPS
-deployment needs a reverse proxy that forwards WebSocket upgrade requests.
+`postgres://` and `postgresql://` URLs are normalized to the psycopg driver. Initial tables are created at startup with a database lock; subsequent schema changes will need explicit migrations. PostgreSQL compatibility is implemented but was not tested against a live hosted database during this change.
 
-### Devices that can't reach each other on LAN
+Optional environment settings:
 
-Some networks (guest Wi-Fi, many offices/cafes) isolate client devices from
-each other even on the same SSID, so the LAN IP approach above won't connect.
-Two ways around it:
+| Variable | Purpose |
+| --- | --- |
+| `DATABASE_URL` | PostgreSQL connection; omit for local SQLite. |
+| `PAIR_STATE_DIR` | Default SQLite directory, normally `var`. |
+| `PUBLIC_ORIGIN` | Exact external origin, such as `https://pair-example.onrender.com`, for origin checks behind a proxy. No trailing slash. |
+| `COOKIE_SECURE` | Set `true` for HTTPS hosting. Secure cookies are also inferred from HTTPS requests. |
 
-**Quick/temporary — tunnel the local server:**
+`.env.example` lists settings; plain startup does not automatically load `.env`. Use environment exports or Uvicorn's `--env-file .env` option. Never commit real connection strings.
 
-```sh
-brew install ngrok
-ngrok config add-authtoken <your-authtoken>   # from the ngrok dashboard
-uvicorn app.main:app --host 0.0.0.0 --port 8000 &
-ngrok http 8000
-```
+## Free Render deployment and persistent accounts
 
-Share the `https://*.ngrok-free.dev` URL `ngrok` prints; both peers open that
-same URL and enter the same room code. On the free plan a tunnel session
-lasts about two hours and gets a new random URL each run. Never commit or
-share an authtoken in plain text.
+`render.yaml` keeps a single free web instance and enables secure cookies. It **does not provision a database**. Render's free filesystem loses local SQLite files on restarts, redeploys, and spin-down, so configure external PostgreSQL before relying on hosted accounts. See [Render's free-service limitations](https://render.com/docs/free).
 
-**Permanent — deploy to Render:**
+One zero-cost option within its usage allowance is [Neon Free](https://neon.com/pricing): create a free PostgreSQL project, copy its SSL connection string, and set it as `DATABASE_URL` in Render's environment settings. Also set `PUBLIC_ORIGIN` to the Render service's actual HTTPS origin. Keep the database on its free plan; no paid service is required by this implementation. This project has not provisioned a Neon project or changed your live Render service.
 
-This repo includes `render.yaml`. In the
-[Render dashboard](https://dashboard.render.com), create a new Blueprint,
-point it at this repository, and Render provisions a free web service from
-that file, builds with `pip install -r requirements.txt`, and runs
-`uvicorn app.main:app --host 0.0.0.0 --port $PORT`. You get a permanent
-`https://pair-room-chat.onrender.com`-style URL with TLS and `wss://`
-handled for you — no expiring link, no local machine needing to stay on.
+Existing local accounts are not automatically copied into a newly configured PostgreSQL database. Account migration is a separate operation.
 
-`numInstances: 1` in `render.yaml` is required, not cosmetic: room state
-lives in process memory (see Extension boundary below), so a second
-instance would never see rooms created on the first. Render's free plan
-spins the service down after inactivity and takes a few seconds to wake on
-the next request.
-
-A shared URL (ngrok or Render) is reachable by anyone who has the link,
-same as any room code; don't post it publicly.
-
-## Layout
+## Project layout
 
 ```text
-app/
-  main.py          HTTP routes and WebSocket validation/dispatch
-  models.py        Strict Pydantic input/output envelopes
-  room_manager.py  Room capacity, membership, ordered delivery, cleanup
-static/
-  index.html       Complete responsive UI with inline CSS/JS
-  dashboard.html   Live /metrics + /health polling dashboard (GET /dashboard)
-scripts/
-  load_test.py     Concurrency/latency/throughput load test, see LOAD_TEST_RESULTS.md
-  kill_test.py     Worker-crash recovery-time test, see LOAD_TEST_RESULTS.md
-tests/
-  test_chat.py     Protocol and lifecycle integration tests
-requirements.txt
-requirements-dev.txt
+app/main.py                 HTTP/static routes, lifecycle, security headers, legacy WS
+app/practice/auth.py        Accounts, sessions, CSRF, auth limits
+app/practice/database.py    SQLAlchemy storage models and SQLite/Postgres setup
+app/practice/routes.py      Session configuration, ownership, drafts, reports
+app/practice/catalog.json   Pinned NeetCode 150 metadata/reference implementations
+app/practice/catalog.py     Catalog assembly
+app/practice/exercises.py   Original prompts, fixtures, comparators/adapters metadata
+static/index.html           Main practice views
+static/practice/app.js      Workspace and runner orchestration
+static/practice/runtime-loader.js  App-hosted runtime download, progress, caching
+static/practice/runtime/314.0.8/   Bundled Pyodide assets, manifest, and notices
+static/practice/styles.css  Responsive light/dark grayscale styling
+static/practice/runner.html Opaque iframe and disposable Python worker
+static/practice/harness.py  Browser-executed correctness/runtime harness
+static/chat.html            Retained two-person chat UI at /chat
+app/room_manager.py         Retained local chat connection lifecycle
+app/models.py               Retained chat WebSocket schemas
+tools/import_neetcode.py    Explicit catalog refresh, never runs on app startup
+tools/browser_smoke.py      Optional real-browser workflow check
+docs/architecture.md        Current architecture and two-person ownership plan
 ```
 
-`GET /` serves the UI; `GET /health` returns `{"status":"ok"}`; `GET /dashboard`
-serves a small live-metrics page; `WS /ws` handles the protocol. Routes do
-not manipulate room storage. A per-room lock
-serializes joins, chats, and departures; per-socket locks serialize delivery.
-Failed/slow sends are bounded, and failed peers are removed with departure
-notifications. Empty rooms are deleted. The browser retains at most 300 log
-entries and clears them when leaving/rejoining; the backend stores no messages.
+The old word/image association game, model cache, datasets, images, dependencies file, and prototype tests have been removed. The old chat remains at `/chat` with `/ws` for later multiplayer work. It still uses in-memory rooms on this branch; **do not run multiple chat workers** without integrating the Redis manager from GitHub `main`. Redis is not needed by the single-player practice flow.
 
-## Protocol
-
-Every event is `{"type":"...","payload":{...}}`. Unknown event types, extra
-fields, incorrect types, binary frames, and malformed JSON receive `INVALID_MSG`
-without crashing the handler. Invalid chat payloads leave the connection usable.
-The first meaningful event must be `join`. A socket joins only one room.
-
-Client events:
-
-```json
-{"type":"join","payload":{"room":"ABC123","handle":"Alice"}}
-{"type":"chat","payload":{"text":"hello"}}
-{"type":"typing","payload":{"typing":true}}
-{"type":"reaction","payload":{"emoji":"👍"}}
-{"type":"ping","payload":{}}
-```
-
-Room codes are six ASCII alphanumeric characters, normalized to uppercase.
-Handles are optional, at most 32 characters, and default to `Player-1234`-style
-random names. Duplicate handles in one room are rejected with `INVALID_MSG` so
-sent and received messages remain unambiguous. Choose a different name to retry.
-Chat text must contain 1–500 Unicode code points and cannot be all whitespace.
-Text is preserved and rendered with `textContent`, never HTML.
-
-`typing` broadcasts the sender's in-progress state to the room; the client
-sends `true` while composing and `false` on send, idle, or clearing the
-field. `reaction` broadcasts a one-off emoji to the room and must be one of
-`👍 ❤️ 😂 😮 👏`; other values are rejected with `INVALID_MSG`. Both require
-having joined a room first and never trigger a `room_state` refresh.
-
-Server events:
-
-```json
-{"type":"room_state","payload":{"room":"ABC123","status":"waiting","peers":["Alice"]}}
-{"type":"room_state","payload":{"room":"ABC123","status":"paired","peers":["Alice","Bob"]}}
-{"type":"chat","payload":{"sender":"Alice","text":"hello","timestamp":1700000000}}
-{"type":"system","payload":{"text":"Bob joined the room"}}
-{"type":"system","payload":{"text":"Bob left the room"}}
-{"type":"typing","payload":{"sender":"Alice","typing":true}}
-{"type":"reaction","payload":{"sender":"Alice","emoji":"👍"}}
-{"type":"error","payload":{"code":"ROOM_FULL","message":"Room is full"}}
-{"type":"error","payload":{"code":"INVALID_MSG","message":"..."}}
-```
-
-Chats echo to the sender as confirmation and label their handle with `(you)`.
-The light/dark toggle remembers your choice in the browser when storage is available.
-Timestamps are server-generated Unix seconds. On departure, the wire status
-returns to `waiting`; the UI updates the capacity and logs the departure.
-Browser heartbeats
-send `ping` every 20 seconds, with no protocol `pong`. The server closes sockets
-that send nothing for 60 seconds (15 seconds before joining). Physical network
-loss detection depends on WebSocket transport timeouts; clean closes notify
-survivors as soon as the server receives the disconnect.
-
-## Tests
+## Verification
 
 ```sh
 pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-## Extension boundary
+Tests verify all 150 references against 460 fixtures, starter failures, account security, ownership, draft revision conflicts, score invalidation, filtering, deadlines, persistence across restarts, and retained chat lifecycle. Native harness tests execute trusted reference/test snippets, never arbitrary web submissions.
 
-By default, run **one Uvicorn worker**: all presence is in process memory and
-disappears on restart. In-memory WebSocket presence is process-local, as
-described in the
-[FastAPI WebSocket documentation](https://fastapi.tiangolo.com/advanced/websockets/).
-The protocol uses [Pydantic discriminated unions](https://docs.pydantic.dev/latest/concepts/unions/#discriminated-unions)
-so new lobby/game events can be added explicitly.
-
-To grow this MVP, add event schemas and dispatch handlers; keep membership and
-delivery behind `RoomManager`. Room codes are sharing conveniences, not
-authentication or access control.
-
-### Running multiple workers (Redis-backed)
-
-Set `REDIS_URL` (e.g. `redis://localhost:6379/0`) and the app switches to
-`app/redis_room_manager.RedisRoomManager` instead of the in-process
-`RoomManager`. This makes it safe to run more than one Uvicorn
-worker/instance pointed at the same Redis:
-
-- **Membership** (who is in which room) lives in Redis, checked and updated
-  atomically by a Lua script, so capacity and duplicate-handle checks are
-  correct even when two workers race to join the same room.
-- **Delivery** happens over Redis Pub/Sub: a worker never has another
-  worker's actual `WebSocket` object, so instead it publishes every event to
-  a per-room channel, and each worker's own listener task forwards incoming
-  events only to the local sockets it holds.
-- A peer that disconnects is removed from Redis and the departure is
-  published so peers on *other* workers see it too.
-- **Crash recovery**: each peer's connection carries a Redis presence key
-  (`presence:{room}:{peer_id}`, 90s TTL) refreshed on every browser `ping`.
-  The TTL is set well above the 20s ping interval because backgrounded
-  browser tabs commonly throttle `setInterval` to roughly once a minute —
-  a routine case, not a crash, and the margin must absorb it or a merely
-  backgrounded peer gets reaped out from under a still-open socket. Each
-  worker also runs a periodic sweep (every ~20s) across the whole room
-  keyspace and removes any peer whose presence key lapsed — not just peers
-  it holds locally, since a *crashed* worker's own bookkeeping is gone and
-  only another worker's sweep can notice. Whichever worker's sweep or
-  disconnect actually removes a peer from Redis also publishes an internal
-  eviction signal on the room's channel, so if that peer is really live
-  and held locally by a *different* worker (not the crashed/sweeping one),
-  that worker drops it and closes its socket too — otherwise it would keep
-  chatting as a zombie even after Redis and every other peer have
-  forgotten it. Worst-case detection is roughly the TTL plus the sweep
-  interval (around two minutes), during which a room with a crashed peer
-  can still look full to a new joiner. Every `ping`-triggered heartbeat
-  also refreshes the room hash's own safety-net TTL, not just the peer's
-  presence key, so a long-lived active room never expires out from under
-  two still-connected peers.
-
-This is still MVP-grade: no message history, no auth beyond the room code.
-`tests/test_redis_room_manager.py` exercises all of the above — including
-simulated crashes — by running two `RedisRoomManager` instances against one
-shared [fakeredis](https://github.com/cunla/fakeredis-py) server to prove
-cross-worker join/chat/disconnect/reap behavior without real multi-process
-infra.
-
-### Real multi-process integration tests
-
-`tests/test_redis_room_manager.py` proves the algorithm is correct, but
-runs entirely in one process against a fake Redis and fake sockets. It
-can't catch a bug that only shows up across real separate OS processes, a
-real Redis connection over the network, or real WebSocket/TCP round trips.
-`tests/test_multiprocess_integration.py` closes that gap: it launches two
-actual `uvicorn app.main:app` processes on different ports, points both at
-one real Redis (a disposable `redis:7-alpine` Docker container, or an
-externally provided `PAIR_TEST_REDIS_URL`), and drives them with real
-WebSocket clients to prove cross-process chat delivery and that a crashed
-peer (its TCP connection aborted with no close handshake) actually gets
-reaped by the *other* process within a few seconds.
-
-This suite is opt-in — excluded from the default `pytest -q` run via
-`pytest.ini`'s `addopts = -m "not integration"`, since it needs Docker (or
-a real reachable Redis) and takes noticeably longer than the rest of the
-suite. Run it explicitly with:
+Optional real-browser workflow (run a local server separately):
 
 ```sh
-python -m pytest -m integration -v
+pip install playwright
+playwright install chromium
+python tools/browser_smoke.py
 ```
 
-Without Docker running and without `PAIR_TEST_REDIS_URL` set, every test in
-this file skips cleanly rather than erroring. Two env vars exist purely to
-make the crash/reap scenario testable in seconds instead of the real ~2
-minute worst case — `PAIR_PRESENCE_TTL_SECONDS` and
-`PAIR_REAP_INTERVAL_SECONDS` override the constants of the same name in
-`app/redis_room_manager.py`; production behavior is unchanged unless they
-are explicitly set.
+Set `PAIR_TEST_URL` for another local URL, or `PAIR_CHROME` to an installed Chrome executable. The script creates a disposable test account and checks registration, catalog selection, Python execution, submission, history, login, themes, mobile layout, interruption, and runtime isolation.
 
-`tests/test_load_balancer_integration.py` closes a related but separate
-gap: the Redis Pub/Sub design was specifically chosen so WebSocket
-connections never need session affinity ("sticky sessions") — any worker
-can deliver any room's events once it has a local peer in that room. That
-claim had never been tested against an actual reverse proxy, only two
-manually-dialed local ports. This test puts two real `uvicorn` processes
-behind a real `nginx:alpine` container doing plain round-robin (no
-`ip_hash`), connects two real WebSocket clients through the one proxy URL,
-and proves they land on different backends yet still chat correctly. Same
-opt-in/skip rules as above. It does **not** test Render's actual production
-load balancer — that's a managed black box you can't instantiate locally —
-see "Scaling beyond one instance in production" below for that distinction.
+The browser test blocks all HTTP requests to external origins. Set `PAIR_TEST_ALL=1` to additionally verify all 150 reference suites in real browser Python. Set `PAIR_TEST_RUNTIME_FAILURES=1` to verify a failed runtime download, cancellation during download, an incompatible cached runner, and successful retry. The test also confirms that Run followed by Submit does not download runtime files twice.
 
-### Observability
+## Attribution
 
-`GET /metrics` returns a small JSON object of per-process counters:
-`rooms_active`, `peers_connected_total`, `reap_sweeps_total`, and
-`peers_reaped_total`. These are deliberately plain counters in a
-`dataclass` (`app/metrics.py`), not Prometheus-format output — nothing in
-this deployment scrapes Prometheus, and a 2-peer ephemeral chat MVP doesn't
-warrant a metrics backend, alerting, or an APM. Each worker reports only
-what it has personally seen; there's no cross-worker aggregation, matching
-the rest of this app's design where only Redis room membership is actually
-shared state. If cluster-wide totals were ever needed, the natural
-follow-up is a small Redis-backed `INCR` per counter — not built now, since
-nothing currently needs it.
-
-`GET /dashboard` renders those same two endpoints (`/metrics` + `/health`)
-as a small auto-refreshing page instead of raw JSON — counters, a live event
-log for joins/reaps/sweeps, and a connectivity indicator. Same per-process
-scope as `/metrics` itself: it shows whichever worker answers that request,
-not a cluster total.
-
-### Load testing and crash recovery, with real numbers
-
-`scripts/load_test.py` and `scripts/kill_test.py` spin up real `uvicorn`
-worker processes against a real Dockerized Redis and drive them with real
-WebSocket clients (same pattern as the integration tests above, but as
-standalone CLIs rather than pytest tests, since a full run takes
-seconds-to-minutes). Full results, methodology, and reproduction commands
-are in [`LOAD_TEST_RESULTS.md`](./LOAD_TEST_RESULTS.md), including the test
-machine's specs — load generator and workers shared one laptop, so absolute
-throughput/latency numbers are directional, not a production ceiling.
-Headline findings from a run on 2026-11-23:
-
-- **1,000 concurrent clients (500 rooms) breaks a single worker** — most
-  pairs time out and the process stops answering `/health`; the *same*
-  1,000-client load runs clean on 2 workers, and 2,000 clients (which breaks
-  2 workers) runs clean on 4. That's the measured fact behind "horizontally
-  scalable," not just the Redis Pub/Sub design.
-- **Worker crash recovery takes ~100 seconds** with production defaults
-  (`SIGKILL` on one worker mid-session; the surviving peer's room returns to
-  `waiting` and is immediately rejoinable). That's a deliberate tradeoff, not
-  a slow implementation: dropping to a 20s TTL / 5s sweep cuts recovery to
-  ~25s, but 20s is shorter than the ~60s throttle browsers commonly apply to
-  backgrounded tabs' heartbeat, so it would start evicting peers who are
-  merely backgrounded, not crashed. Both numbers are measured — see
-  `scripts/kill_test.py --ttl`/`--reap-interval` and the "Why 100 seconds"
-  section of `LOAD_TEST_RESULTS.md`.
-
-### Known gaps that are not closeable in this repo
-
-Two things were considered for distributed-system hardening and
-deliberately left undone, because building fake code to "solve" them would
-be actively misleading:
-
-- **Redis is a single point of failure.** `RedisRoomManager` takes one
-  `redis_url` — there is no Sentinel/cluster-aware client wiring, and
-  `fakeredis` cannot simulate real primary/replica failover, so a test that
-  claimed to prove HA would prove nothing. Real resilience here needs a
-  Sentinel quorum (or a managed Redis product with failover) and
-  Sentinel-aware client code — both outside what this codebase or its
-  current (free-tier) hosting can provide. What *is* in place: the Redis
-  Pub/Sub listener and reap loop now log a warning and retry/reconnect
-  automatically on a dropped Redis connection, rather than silently
-  stalling delivery forever (see `RECONNECT_BACKOFF_SECONDS` in
-  `app/redis_room_manager.py`) — that's an honest improvement to this
-  single Redis's failure visibility, not a fix for it being a SPOF.
-- **No horizontal autoscaling.** `render.yaml` runs `plan: free`,
-  `numInstances: 1`. Render's free tier does not support `numInstances`
-  greater than 1, CPU/memory-based autoscaling, or rolling deploys across
-  multiple instances at any configuration — that functionality exists only
-  on Render's paid "Standard" tier and above. There is nothing to build in
-  this repo to close this gap; it is a hosting-plan upgrade, not a code
-  change. The app's code already supports running N instances correctly
-  (that's what the Redis work above is for), and `GET /health` is already
-  a ready-to-use health-check endpoint the moment a higher tier is in use.
-
-#### Scaling beyond one instance in production
-
-Once (and only if) this project moves to a Render plan that supports it,
-scaling out is a `render.yaml` config change, not a code change:
-
-```yaml
-services:
-  - type: web
-    name: pair-room-chat
-    plan: standard        # numInstances > 1 requires a paid plan
-    numInstances: 2        # or a {min, max} range, per Render's current schema
-    envVars:
-      - key: REDIS_URL
-        value: <your Redis instance URL>
-```
-
-Render fronts all instances with its own managed load balancer
-automatically — there is no user-configurable LB to install or test
-against on Render itself; `tests/test_load_balancer_integration.py` above
-is a stand-in proving the underlying no-sticky-sessions architecture is
-sound, not a claim that it was tested against Render's specific LB.
+Catalog metadata and Python reference implementations come from [neetcode-gh/leetcode](https://github.com/neetcode-gh/leetcode), pinned to commit `2736633bf3d8a81115b10f299306be91cf822f39`, under its [MIT license](app/practice/NEETCODE_LICENSE.txt). Some upstream files contain multiple approaches; the importer keeps the first complete class per name, includes helper classes, and adapts the standalone Meeting Rooms II function to a Solution class. Prompts and fixtures in `exercises.py` were authored for this app. Private problem statements and private judge tests were not imported. Pair is not affiliated with NeetCode or LeetCode. Bundled Pyodide assets and source/license notices are documented in [the runtime README](static/practice/runtime/314.0.8/README.md).

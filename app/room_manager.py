@@ -11,7 +11,6 @@ from dataclasses import dataclass, field
 
 from fastapi import WebSocket, WebSocketDisconnect
 
-from app.metrics import Metrics
 from app.models import (
     ChatBroadcast, ChatPayload, ErrorEvent, ErrorPayload, ReactionBroadcast,
     ReactionPayload, RoomStateEvent, RoomStatePayload, ServerEvent,
@@ -40,8 +39,6 @@ class RoomManager:
 
     def __init__(self) -> None:
         self._rooms: dict[str, Room] = {}
-        self.metrics = Metrics()
-        self.metrics.set_rooms_active_getter(lambda: len(self._rooms))
 
     async def connect(self, socket: WebSocket) -> Peer:
         await socket.accept()
@@ -94,14 +91,10 @@ class RoomManager:
                     return False
                 peer.handle, peer.room = handle, code
                 room.peers.append(peer)
-                self.metrics.record_join()
                 await self._publish(room, SystemEvent(payload=SystemPayload(
                     text=f"{handle} joined the room",
                 )))
                 return peer.room is not None
-
-    async def heartbeat(self, peer: Peer) -> None:
-        """No-op here; only RedisRoomManager needs a liveness signal to reap."""
 
     async def chat(self, peer: Peer, text: str) -> None:
         code = peer.room
