@@ -63,16 +63,27 @@ def same_origin(request: Request):
         raise HTTPException(403, "Request origin is not allowed")
 
 
-def current_login(request: Request):
-    token = request.cookies.get(COOKIE, "")
-    with request.app.state.database.session() as db:
+def user_for_token(database, token: str):
+    """Shared by the HTTP cookie check and the WebSocket handshake cookie
+    check (sockets have no per-request Depends, so app.main calls this
+    directly to identify a peer by account at connect time).
+    """
+    with database.session() as db:
         login = db.get(Login, token_hash(token))
         if login is None or login.expires_at <= time.time():
-            raise HTTPException(401, "Sign in to continue")
+            return None, None
         user = db.get(User, login.user_id)
         if not user:
-            raise HTTPException(401, "Sign in to continue")
+            return None, None
         return user, login
+
+
+def current_login(request: Request):
+    token = request.cookies.get(COOKIE, "")
+    user, login = user_for_token(request.app.state.database, token)
+    if user is None:
+        raise HTTPException(401, "Sign in to continue")
+    return user, login
 
 
 def authenticated_write(request: Request, identity=Depends(current_login)):

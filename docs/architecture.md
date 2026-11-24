@@ -217,17 +217,24 @@ Deviation from the original draft: a synchronous match returns only `match_id`, 
 
 Deviation from the original draft: no nested `problems` array — the caller already has that from `GET /api/ranked/matches/{id}` and duplicating it here would need another join per row for no new information.
 
-### WebSocket — still a draft, not implemented
+### WebSocket — implemented
 
-Deferred past Phase 1, not merely delayed by accident: the existing `RoomManager`/`RedisRoomManager` deliver by **room code**, with anonymous handles — there is no existing concept of "deliver to this account's socket wherever it is." Ranked mode needs exactly that (push a match found to a queued account before it has joined any room), which is new plumbing this phase didn't build. `GET /api/ranked/queue` polling stands in for `MATCH_FOUND` until that lands. The shapes below are the original Phase 0 draft, unchanged, and still the target once the per-account delivery problem is solved:
+Was the one deliberately deferred piece of Phase 1; now built. The gap was real, not a formality: `RoomManager`/`RedisRoomManager` deliver by **room code** with anonymous handles, and there was no way to reach "this account's socket" before it had joined a room — exactly what a queued ranked player needs. Fixed by adding per-account identity and delivery alongside the existing room mechanism, not replacing it:
 
-`MATCH_FOUND` (server → both clients):
+- `Peer` (both `app/room_manager.py` and `app/redis_room_manager.py`) gained a `user_id` field, set by a new `identify(peer, user_id)` call.
+- `app/main.py`'s `/ws` endpoint identifies a connecting socket automatically from its `pair_session` cookie via `auth.user_for_token` (best-effort — a missing/expired cookie just leaves the peer anonymous, same as plain chat today). This happens once, right after `connect()`, before the client sends anything.
+- Both managers gained `send_to_user(user_id, event) -> bool`. `RoomManager`'s is a local dict lookup and reports real delivery success. `RedisRoomManager`'s publishes to a `user:<id>` Pub/Sub channel (parallel to the existing `chan:<room>` ones, same listener task, same `psubscribe`) and always returns `True` — it cannot confirm a different worker actually delivered it, only that the publish went out.
+- `PingEvent` now works with no room joined (previously it was swallowed by "Send a join event first"), since a queued player has no room yet but still needs to survive the idle timeout.
+
+`MATCH_FOUND` (server → both clients, pushed from `POST /api/ranked/queue` the moment a match is created):
 
 ```json
 {"type": "match_found", "payload": {"match_id": "a1b2c3", "opponent": "someuser", "opponent_rating": 1042, "deadline": 1764013800.0, "problems": [{"id": "two-sum", "title": "Two Sum"}]}}
 ```
 
-`OPPONENT_PROGRESS` (server → the other client only; broadcast on every opponent Submit):
+`GET /api/ranked/queue` polling remains as a fallback for whenever delivery can't be confirmed (an unidentified socket, no socket open at all, or — see above — any push at all under `RedisRoomManager`, since it can't confirm delivery). `_PENDING_MATCH` is popped as soon as a push reports `True`, and separately, the queue's own "already matched" guard is a DB query (`_has_active_match`), not `_PENDING_MATCH` — the dict is purely a notification mailbox now; it must never also gate re-queueing, since it's expected to get cleared out from under an active match.
+
+`OPPONENT_PROGRESS` (server → the opponent only, pushed from `PUT /api/ranked/matches/{id}/work/{problem_id}` on every submission with a report):
 
 ```json
 {"type": "opponent_progress", "payload": {"problem_statuses": {"two-sum": "passed", "lru-cache": "attempted"}, "correctness": 62.5}}
@@ -235,11 +242,13 @@ Deferred past Phase 1, not merely delayed by accident: the existing `RoomManager
 
 Never contains code, stdout, or per-case detail — see the trust-boundary note in the Obsidian plan on why this stays coarse.
 
-`MATCH_RESULT` (server → both clients, once):
+`MATCH_RESULT` (server → both clients, pushed exactly once, from whichever `GET /api/ranked/matches/{id}` call's `_finalize_if_ready` actually flips the match to `completed`):
 
 ```json
 {"type": "match_result", "payload": {"outcome": "win", "my_correctness": 100.0, "opponent_correctness": 62.5, "rating_before": 1000, "rating_after": 1016, "opponent_rating_after": 1026}}
 ```
+
+Covered by `tests/test_redis_room_manager.py` (cross-worker `send_to_user`, unknown-account no-op, disconnect clearing identity), `tests/test_chat.py` (ping before join), and `tests/practice/test_ranked_routes.py` (end-to-end over real `/ws` connections: `MATCH_FOUND` to both sides, `OPPONENT_PROGRESS` to the opponent on submit, `MATCH_RESULT` to both on finalize).
 
 ### Data model
 

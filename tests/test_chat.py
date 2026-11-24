@@ -179,6 +179,16 @@ def test_typing_and_reaction_require_join():
         assert expect(socket, "error")["message"] == "Send a join event first"
 
 
+def test_ping_before_join_does_not_error():
+    """A queued ranked player has no room yet but still needs to ping to
+    survive the idle timeout while waiting for a match.
+    """
+    with TestClient(app) as client, client.websocket_connect("/ws") as socket:
+        socket.send_json({"type": "ping", "payload": {}})
+        socket.send_json({"type": "join", "payload": {"room": "ABC123", "handle": "Alice"}})
+        assert expect(socket, "system")["text"] == "Alice joined the room"
+
+
 def test_rooms_are_isolated(client):
     with joined(client) as (alice, _), joined(client, "Bob", "XYZ789") as (bob, state):
         assert state["peers"] == ["Bob"]

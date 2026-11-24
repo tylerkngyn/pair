@@ -160,3 +160,76 @@ def test_history_lists_opponent_and_outcome(client, monkeypatch):
     assert len(history) == 1
     assert history[0]["opponent"] == "bob"
     assert history[0]["outcome"] == "win"
+
+
+def test_match_found_pushed_over_websocket_to_both_sides(client):
+    """End-to-end over the real cookie-identified /ws path: a queued
+    account's open socket receives MATCH_FOUND the moment the opponent's
+    POST /api/ranked/queue matches it, with no polling involved.
+    """
+    alice = register(client, "alice")
+    as_(client, alice)
+    with client.websocket_connect("/ws") as alice_ws:
+        client.post("/api/ranked/queue", json=FILTERS)
+
+        bob = register(client, "bob")
+        as_(client, bob)
+        with client.websocket_connect("/ws") as bob_ws:
+            matched = client.post("/api/ranked/queue", json=FILTERS)
+            match_id = matched.json()["match_id"]
+
+            bob_event = bob_ws.receive_json()
+            assert bob_event["type"] == "match_found"
+            assert bob_event["payload"]["match_id"] == match_id
+            assert bob_event["payload"]["opponent"] == "alice"
+
+        alice_event = alice_ws.receive_json()
+        assert alice_event["type"] == "match_found"
+        assert alice_event["payload"]["match_id"] == match_id
+        assert alice_event["payload"]["opponent"] == "bob"
+
+    # Consumed by delivery, not left pending for the poll fallback.
+    as_(client, alice)
+    assert client.get("/api/ranked/queue").json() == {"status": "idle"}
+
+
+def test_opponent_progress_and_match_result_pushed_over_websocket(client, monkeypatch):
+    monkeypatch.setattr(ranked_routes, "SUBMISSION_PLAUSIBILITY_FLOOR_SECONDS", 0)
+    from app.practice.catalog import PROBLEMS
+
+    alice = register(client, "alice")
+    as_(client, alice)
+    with client.websocket_connect("/ws") as alice_ws:
+        client.post("/api/ranked/queue", json=FILTERS)
+        bob = register(client, "bob")
+        as_(client, bob)
+        with client.websocket_connect("/ws") as bob_ws:
+            match_id = client.post("/api/ranked/queue", json=FILTERS).json()["match_id"]
+            bob_ws.receive_json()  # match_found
+            alice_ws.receive_json()  # match_found
+
+            problem_id = client.get(f"/api/ranked/matches/{match_id}").json()["problems"][0]["id"]
+            total = len(PROBLEMS[problem_id]["cases"])
+
+            as_(client, bob)
+            _submit(client, bob, match_id, problem_id, total, total)
+            progress = alice_ws.receive_json()
+            assert progress["type"] == "opponent_progress"
+            assert progress["payload"]["correctness"] == 100.0
+            assert progress["payload"]["problem_statuses"][problem_id] == "passed"
+
+            with client.app.state.database.session.begin() as db:
+                row = db.get(ranked_routes.RankedMatch, match_id)
+                row.deadline = time.time() - 1
+
+            as_(client, alice)
+            result = client.get(f"/api/ranked/matches/{match_id}").json()
+            assert result["my_outcome"] == "loss"
+
+            alice_result = alice_ws.receive_json()
+            assert alice_result["type"] == "match_result"
+            assert alice_result["payload"]["outcome"] == "loss"
+
+            bob_result = bob_ws.receive_json()
+            assert bob_result["type"] == "match_result"
+            assert bob_result["payload"]["outcome"] == "win"

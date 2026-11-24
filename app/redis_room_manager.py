@@ -20,6 +20,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 from redis.asyncio import Redis
 
 CHANNEL_PREFIX = "chan:"
+USER_CHANNEL_PREFIX = "user:"
 ROOM_KEY_PREFIX = "room:"
 PRESENCE_KEY_PREFIX = "presence:"
 ROOM_TTL_SECONDS = 3600  # Safety net only; rooms are deleted explicitly on empty.
@@ -59,6 +60,7 @@ class Peer:
     id: str = field(default_factory=lambda: secrets.token_hex(8))
     handle: str = ""
     room: str | None = None
+    user_id: str | None = None
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -72,6 +74,11 @@ class RedisRoomManager:
         self._redis = client if client is not None else Redis.from_url(redis_url, decode_responses=True)
         self._join_script = self._redis.register_script(_JOIN_SCRIPT)
         self._local_peers: dict[str, list[Peer]] = {}
+        # Routing only, not shared membership: which account maps to which
+        # locally-held socket. Never written to Redis — a stale entry here
+        # just means delivery misses until the peer reconnects and
+        # re-identifies, same failure mode as a dropped Pub/Sub message.
+        self._local_users: dict[str, Peer] = {}
         self._listener_task: asyncio.Task | None = None
         self._reap_task: asyncio.Task | None = None
 
@@ -127,6 +134,30 @@ class RedisRoomManager:
 
     async def _publish(self, code: str, event: dict) -> None:
         await self._redis.publish(f"{CHANNEL_PREFIX}{code}", json.dumps(event))
+
+    async def identify(self, peer: Peer, user_id: str) -> None:
+        """Associate a peer with an account so it can be reached by user_id
+        alone, before (or without) ever joining a room — e.g. a queued
+        ranked player waiting for MATCH_FOUND, which may be handled by a
+        different worker than the one that eventually finds the match.
+        """
+        peer.user_id = user_id
+        self._local_users[user_id] = peer
+
+    async def send_to_user(self, user_id: str, event) -> bool:
+        """Publishes to every worker; only the one holding this user_id
+        locally (if any) actually delivers it. Unlike room events, this
+        is point-to-point — no membership state, no eviction notice.
+
+        Always returns True: unlike RoomManager's version, this can't
+        confirm a different worker actually delivered it, only that the
+        publish went out. A caller using the return value as a delivery
+        confirmation (ranked_routes.py's _PENDING_MATCH cleanup does) will
+        treat every push as delivered in Redis-backed deployments — the
+        poll fallback still exists for exactly this reason.
+        """
+        await self._redis.publish(f"{USER_CHANNEL_PREFIX}{user_id}", json.dumps(event.model_dump()))
+        return True
 
     async def _room_state_event(self, code: str) -> dict:
         handles = list((await self._redis.hgetall(self._room_key(code))).values())
@@ -210,6 +241,8 @@ class RedisRoomManager:
         drops bookkeeping and Redis membership — it never re-closes the
         socket itself, unlike _remove_peer used by reap/eviction below.
         """
+        if peer.user_id is not None and self._local_users.get(peer.user_id) is peer:
+            del self._local_users[peer.user_id]
         code = peer.room
         if code is None:
             return
@@ -307,14 +340,21 @@ class RedisRoomManager:
     async def _listen(self) -> None:
         async with self._redis.pubsub() as pubsub:
             await pubsub.psubscribe(f"{CHANNEL_PREFIX}*")
+            await pubsub.psubscribe(f"{USER_CHANNEL_PREFIX}*")
             async for message in pubsub.listen():
                 if message["type"] != "pmessage":
                     continue
-                code = message["channel"].removeprefix(CHANNEL_PREFIX)
+                channel = message["channel"]
                 try:
                     event = json.loads(message["data"])
                 except ValueError:
                     continue
+                if channel.startswith(USER_CHANNEL_PREFIX):
+                    peer = self._local_users.get(channel.removeprefix(USER_CHANNEL_PREFIX))
+                    if peer is not None:
+                        await self._send_raw(peer, event)
+                    continue
+                code = channel.removeprefix(CHANNEL_PREFIX)
                 if event.get("type") == "_evict":
                     await self._handle_evict(code, event["payload"]["peer_id"])
                     continue

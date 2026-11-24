@@ -9,6 +9,7 @@ import pytest
 from fakeredis import FakeServer
 from fakeredis.aioredis import FakeRedis
 
+from app.models import SystemEvent, SystemPayload
 from app.redis_room_manager import Peer, RedisRoomManager
 
 
@@ -47,6 +48,7 @@ def run_with_workers(worker_a, worker_b, body):
     async def wrapper():
         await worker_a.start()
         await worker_b.start()
+        await settle()  # Let both listener tasks finish subscribing before body() publishes anything.
         try:
             await body()
         finally:
@@ -333,5 +335,51 @@ def test_heartbeat_extends_room_ttl(two_workers):
 
         ttl = await worker_a._redis.ttl(worker_a._room_key("ABC123"))
         assert ttl > 5
+
+    run_with_workers(worker_a, worker_b, scenario)
+
+
+def test_send_to_user_reaches_account_on_a_different_worker(two_workers):
+    """The case ranked matchmaking needs: a queued account has no room yet,
+    may be held by a different worker than the one handling the match, and
+    must still receive a push addressed to its user_id alone.
+    """
+    worker_a, worker_b = two_workers
+
+    async def scenario():
+        alice = Peer(socket=FakeSocket())
+        await worker_a.identify(alice, "user-alice")
+
+        delivered = await worker_b.send_to_user("user-alice", SystemEvent(payload=SystemPayload(text="match found")))
+        await settle()
+
+        assert delivered
+        assert any(e["type"] == "system" and e["payload"]["text"] == "match found" for e in alice.socket.events)
+
+    run_with_workers(worker_a, worker_b, scenario)
+
+
+def test_send_to_user_unknown_account_is_a_silent_no_op(two_workers):
+    worker_a, worker_b = two_workers
+
+    async def scenario():
+        await worker_a.send_to_user("nobody-queued", SystemEvent(payload=SystemPayload(text="match found")))
+        await settle()  # Nothing should raise; there's simply no local peer anywhere to deliver to.
+
+    run_with_workers(worker_a, worker_b, scenario)
+
+
+def test_disconnect_clears_user_identity(two_workers):
+    worker_a, worker_b = two_workers
+
+    async def scenario():
+        alice = Peer(socket=FakeSocket())
+        await worker_a.identify(alice, "user-alice")
+        await worker_a.disconnect(alice)
+
+        await worker_b.send_to_user("user-alice", SystemEvent(payload=SystemPayload(text="match found")))
+        await settle()
+
+        assert alice.socket.events == []
 
     run_with_workers(worker_a, worker_b, scenario)

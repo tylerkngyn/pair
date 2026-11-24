@@ -13,6 +13,7 @@ from pydantic import ValidationError
 
 from app.models import ChatEvent, JoinEvent, PingEvent, ReactionEvent, TypingEvent, client_event_adapter
 from app.room_manager import RoomManager
+from app.practice import auth
 from app.practice.database import Database
 from app.practice.ranked_routes import router as ranked_router
 from app.practice.routes import router as practice_router
@@ -91,10 +92,19 @@ async def health():
 async def websocket_endpoint(socket: WebSocket):
     manager: RoomManager = socket.app.state.rooms
     peer = await manager.connect(socket)
+    # Identifies the socket to its account, if any, so it can be reached by
+    # user_id alone before joining any room — e.g. a queued ranked player
+    # waiting for MATCH_FOUND. Best-effort: an absent/expired cookie just
+    # leaves the peer anonymous, same as plain chat today.
+    user, _login = auth.user_for_token(socket.app.state.database, socket.cookies.get(auth.COOKIE, ""))
+    if user is not None:
+        await manager.identify(peer, user.id)
     try:
         while True:
-            # Browser pings keep joined sockets alive, including an idle chat.
-            frame = await asyncio.wait_for(socket.receive(), 60 if peer.room else 15)
+            # Browser pings keep an idle socket alive, joined or not — a
+            # queued ranked player has no room yet but still needs to
+            # survive the idle timeout while waiting for a match.
+            frame = await asyncio.wait_for(socket.receive(), 60 if (peer.room or peer.user_id) else 15)
             if frame["type"] == "websocket.disconnect":
                 break
             raw = frame.get("text")
@@ -115,6 +125,12 @@ async def websocket_endpoint(socket: WebSocket):
                     # End this attempt so the UI can retry with a fresh socket.
                     await manager.close(peer, 1008)
                     break
+            elif isinstance(event, PingEvent):
+                # One-way; the protocol has no pong event. Also refreshes
+                # Redis-side presence so a crashed worker's peers can be
+                # reaped. Allowed with no room joined (a queued ranked
+                # player has none yet) unlike the other event types below.
+                await manager.heartbeat(peer)
             elif peer.room is None:
                 await manager.error(peer, "Send a join event first")
             elif isinstance(event, ChatEvent):
@@ -125,10 +141,6 @@ async def websocket_endpoint(socket: WebSocket):
                 await manager.typing(peer, event.payload.typing)
             elif isinstance(event, ReactionEvent):
                 await manager.react(peer, event.payload.emoji)
-            elif isinstance(event, PingEvent):
-                # One-way; the protocol has no pong event. Also refreshes
-                # Redis-side presence so a crashed worker's peers can be reaped.
-                await manager.heartbeat(peer)
     except (WebSocketDisconnect, OSError):
         pass
     except TimeoutError:

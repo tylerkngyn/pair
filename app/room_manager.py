@@ -23,6 +23,7 @@ class Peer:
     socket: WebSocket
     handle: str = ""
     room: str | None = None
+    user_id: str | None = None
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -39,6 +40,7 @@ class RoomManager:
 
     def __init__(self) -> None:
         self._rooms: dict[str, Room] = {}
+        self._users: dict[str, Peer] = {}
 
     async def connect(self, socket: WebSocket) -> Peer:
         await socket.accept()
@@ -46,6 +48,21 @@ class RoomManager:
 
     async def heartbeat(self, peer: Peer) -> None:
         """No-op here; only RedisRoomManager needs a liveness signal to reap."""
+
+    async def identify(self, peer: Peer, user_id: str) -> None:
+        """Associate a peer with an account so it can be reached by user_id
+        alone, before (or without) ever joining a room — e.g. a queued
+        ranked player waiting for MATCH_FOUND. A newer connection for the
+        same account replaces the older one as the delivery target.
+        """
+        peer.user_id = user_id
+        self._users[user_id] = peer
+
+    async def send_to_user(self, user_id: str, event: ServerEvent) -> bool:
+        peer = self._users.get(user_id)
+        if peer is None:
+            return False
+        return await self.send(peer, event)
 
     async def send(self, peer: Peer, event: ServerEvent) -> bool:
         """Serialize sends per socket; a slow/broken peer cannot stall forever."""
@@ -137,6 +154,8 @@ class RoomManager:
             )))
 
     async def disconnect(self, peer: Peer) -> None:
+        if peer.user_id is not None and self._users.get(peer.user_id) is peer:
+            del self._users[peer.user_id]
         code = peer.room
         room = self._rooms.get(code) if code is not None else None
         if room is None:

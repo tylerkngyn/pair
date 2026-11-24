@@ -3,9 +3,11 @@
 Phase 1: a plain in-process queue (per the build checklist's "don't
 over-build it now" — this gets replaced by the Redis sorted-set queue in
 Phase 2). Matching happens synchronously inside POST /api/ranked/queue
-against anyone already waiting; a side that was already queued learns
-about the match by polling GET /api/ranked/queue, since this phase has no
-per-account WebSocket delivery yet to push MATCH_FOUND unprompted.
+against anyone already waiting. MATCH_FOUND/OPPONENT_PROGRESS/MATCH_RESULT
+push over app.state.rooms's per-account delivery (RoomManager.send_to_user /
+RedisRoomManager.send_to_user); GET /api/ranked/queue polling stays as a
+fallback for a client whose socket was never identified (no valid cookie
+at connect time, or no socket open at all).
 """
 import random
 import secrets
@@ -19,6 +21,11 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
+from app.models import (
+    MatchFoundEvent, MatchFoundPayload, MatchFoundProblem,
+    MatchResultEvent, MatchResultPayload,
+    OpponentProgressEvent, OpponentProgressPayload,
+)
 from app.practice import auth
 from app.practice.auth import token_hash
 from app.practice.catalog import PROBLEMS
@@ -51,6 +58,21 @@ class QueueFilters(StrictModel):
 
 def _widen(waited_seconds: float) -> int:
     return min(MAX_WINDOW, MIN_WINDOW + WINDOW_STEP * int(waited_seconds // WINDOW_GROWTH_SECONDS))
+
+
+def _has_active_match(db, user_id: str) -> bool:
+    """The DB, not _PENDING_MATCH, is the source of truth for "is this
+    account already in a match" — _PENDING_MATCH is just a short-lived
+    MATCH_FOUND notification mailbox and gets popped as soon as it's
+    delivered (by a poll, or by a confirmed WebSocket push), so it must
+    never double as the guard against re-queueing into a second match.
+    """
+    return db.scalar(
+        select(RankedParticipant.match_id)
+        .join(RankedMatch, RankedMatch.id == RankedParticipant.match_id)
+        .where(RankedParticipant.user_id == user_id, RankedMatch.status == "active")
+        .limit(1)
+    ) is not None
 
 
 def _get_or_create_rating(db, user_id: str) -> Rating:
@@ -92,37 +114,62 @@ def _create_match(db, waiting: dict, incoming: dict) -> RankedMatch:
 
 
 @router.post("/queue", status_code=202)
-def join_queue(filters: QueueFilters, request: Request, identity=Depends(auth.authenticated_write)):
+async def join_queue(filters: QueueFilters, request: Request, identity=Depends(auth.authenticated_write)):
     user = identity[0]
+    match_info = None
+    opponent_entry = None
+    incoming = None
     with _LOCK:
-        if any(e["user_id"] == user.id for e in _QUEUE) or user.id in _PENDING_MATCH:
-            raise HTTPException(409, "Already queued or matched")
+        if any(e["user_id"] == user.id for e in _QUEUE):
+            raise HTTPException(409, "Already queued")
         with request.app.state.database.session.begin() as db:
+            if _has_active_match(db, user.id):
+                raise HTTPException(409, "Already in an active match")
             rating_row = _get_or_create_rating(db, user.id)
             incoming = {
                 "user_id": user.id, "username": user.username, "rating": rating_row.rating,
                 "filters": filters.model_dump(), "queued_at": time.time(),
             }
-            for candidate in _QUEUE:
-                if candidate["filters"] != incoming["filters"]:
-                    continue
-                window = _widen(time.time() - candidate["queued_at"])
-                if abs(candidate["rating"] - incoming["rating"]) <= window:
-                    _QUEUE.remove(candidate)
-                    match = _create_match(db, candidate, incoming)
-                    _PENDING_MATCH[candidate["user_id"]] = match.id
-                    _PENDING_MATCH[user.id] = match.id
-                    return {"status": "matched", "match_id": match.id}
-            _QUEUE.append(incoming)
-            return {"status": "queued", "queued_at": incoming["queued_at"]}
+            opponent_entry = next((
+                candidate for candidate in _QUEUE
+                if candidate["filters"] == incoming["filters"]
+                and abs(candidate["rating"] - incoming["rating"]) <= _widen(time.time() - candidate["queued_at"])
+            ), None)
+            if opponent_entry is None:
+                _QUEUE.append(incoming)
+                return {"status": "queued", "queued_at": incoming["queued_at"]}
+            _QUEUE.remove(opponent_entry)
+            match = _create_match(db, opponent_entry, incoming)
+            _PENDING_MATCH[opponent_entry["user_id"]] = match.id
+            _PENDING_MATCH[user.id] = match.id
+            match_info = {
+                "match_id": match.id, "deadline": match.deadline,
+                "problems": [MatchFoundProblem(id=pid, title=PROBLEMS[pid]["title"]) for pid in match.problem_ids],
+            }
+    # Pushed outside both the lock and the transaction: a dropped/slow
+    # delivery should never hold either. _PENDING_MATCH is purely the
+    # GET /api/ranked/queue poll fallback's mailbox at this point (the DB
+    # is what guards against re-queueing, via _has_active_match above), so
+    # a *confirmed* local delivery can safely drop it right away instead of
+    # leaving a stale notification for a poll that will never need it.
+    for side, opponent in ((incoming, opponent_entry), (opponent_entry, incoming)):
+        delivered = await request.app.state.rooms.send_to_user(side["user_id"], MatchFoundEvent(payload=MatchFoundPayload(
+            match_id=match_info["match_id"], opponent=opponent["username"], opponent_rating=opponent["rating"],
+            deadline=match_info["deadline"], problems=match_info["problems"],
+        )))
+        if delivered:
+            with _LOCK:
+                _PENDING_MATCH.pop(side["user_id"], None)
+    return {"status": "matched", "match_id": match_info["match_id"]}
 
 
 @router.delete("/queue")
-def leave_queue(identity=Depends(auth.authenticated_write)):
+def leave_queue(request: Request, identity=Depends(auth.authenticated_write)):
     user_id = identity[0].id
     with _LOCK:
-        if user_id in _PENDING_MATCH:
-            raise HTTPException(409, "Already matched")
+        with request.app.state.database.session() as db:
+            if _has_active_match(db, user_id):
+                raise HTTPException(409, "Already matched")
         before = len(_QUEUE)
         _QUEUE[:] = [e for e in _QUEUE if e["user_id"] != user_id]
         if len(_QUEUE) == before:
@@ -162,43 +209,55 @@ def _finalize_if_ready(db, match: RankedMatch):
     payout. The real exactly-once guarantee across *workers* is a Phase 2
     concern (a Redis finalization lock); single-process Phase 1 only needs
     this status check.
+
+    Returns {user_id: MatchResultPayload-shaped dict} if this call is the
+    one that finalized the match, else None (either still active, or
+    already completed by an earlier call) — the caller uses this to know
+    whether to push MATCH_RESULT, since it should fire exactly once.
     """
     if match.status != "active":
-        return
+        return None
     participants = list(db.scalars(select(RankedParticipant).where(RankedParticipant.match_id == match.id)))
     if len(participants) != 2:
-        return
-    expected = sum(len(PROBLEMS[pid]["cases"]) for pid in match.problem_ids)
+        return None
     work_by_user = {}
     for participant in participants:
+        statuses, correctness = _problem_statuses_and_correctness(db, match, participant.user_id)
         work = list(db.scalars(select(RankedWork).where(RankedWork.match_id == match.id, RankedWork.user_id == participant.user_id)))
-        passed = sum(w.result["passed"] for w in work if w.result)
         last_submit = max((w.result["submitted_at"] for w in work if w.result), default=match.deadline)
-        work_by_user[participant.user_id] = {
-            "correctness": round(100 * passed / expected, 1) if expected else 0.0,
-            "elapsed": last_submit - match.started_at,
-        }
+        work_by_user[participant.user_id] = {"correctness": correctness, "elapsed": last_submit - match.started_at}
     now = time.time()
     # A match finalizes once the deadline has passed. (Early "both sides
     # confirmed ready" finalization is deferred past Phase 1.)
     if now <= match.deadline:
-        return
+        return None
     a, b = participants
     outcome_a, score_a = match_outcome(
         work_by_user[a.user_id]["correctness"], work_by_user[b.user_id]["correctness"],
         work_by_user[a.user_id]["elapsed"], work_by_user[b.user_id]["elapsed"],
     )
     new_a, new_b = elo_update(a.rating_before, b.rating_before, 0, 0, score_a)
-    for participant, outcome, new_rating in ((a, outcome_a, new_a), (b, {"win": "loss", "loss": "win", "draw": "draw"}[outcome_a], new_b)):
+    results = {}
+    for participant, opponent, outcome, new_rating, opponent_new_rating in (
+        (a, b, outcome_a, new_a, new_b),
+        (b, a, {"win": "loss", "loss": "win", "draw": "draw"}[outcome_a], new_b, new_a),
+    ):
         participant.outcome = outcome
         participant.rating_after = new_rating
         rating_row = _get_or_create_rating(db, participant.user_id)
         rating_row.rating = new_rating
         rating_row.matches_played += 1
         rating_row.updated_at = now
+        results[participant.user_id] = {
+            "outcome": outcome, "my_correctness": work_by_user[participant.user_id]["correctness"],
+            "opponent_correctness": work_by_user[opponent.user_id]["correctness"],
+            "rating_before": participant.rating_before, "rating_after": new_rating,
+            "opponent_rating_after": opponent_new_rating,
+        }
     match.status = "completed"
     match.finished_at = now
     db.flush()
+    return results
 
 
 def _ranked_submission_throttle(request, user_id):
@@ -219,8 +278,9 @@ def _ranked_submission_throttle(request, user_id):
 
 
 @router.put("/matches/{match_id}/work/{problem_id}")
-def save_ranked_work(match_id: str, problem_id: str, body: SaveWork, request: Request, identity=Depends(auth.authenticated_write)):
+async def save_ranked_work(match_id: str, problem_id: str, body: SaveWork, request: Request, identity=Depends(auth.authenticated_write)):
     user_id = identity[0].id
+    progress_push = None
     with request.app.state.database.session.begin() as db:
         match = db.get(RankedMatch, match_id)
         if match is None:
@@ -253,25 +313,55 @@ def save_ranked_work(match_id: str, problem_id: str, body: SaveWork, request: Re
         ).values(code=body.code, result=result, revision=RankedWork.revision + 1))
         if changed.rowcount != 1:
             raise HTTPException(409, "This draft changed in another tab. Reload before saving.")
-        return {"revision": body.revision + 1, "result": result}
+        if report:
+            opponent = db.scalar(select(RankedParticipant).where(RankedParticipant.match_id == match_id, RankedParticipant.user_id != user_id))
+            if opponent is not None:
+                progress_push = (opponent.user_id, *_problem_statuses_and_correctness(db, match, user_id))
+        response = {"revision": body.revision + 1, "result": result}
+    if progress_push:
+        opponent_id, statuses, correctness = progress_push
+        await request.app.state.rooms.send_to_user(opponent_id, OpponentProgressEvent(payload=OpponentProgressPayload(
+            problem_statuses=statuses, correctness=correctness,
+        )))
+    return response
+
+
+def _problem_statuses_and_correctness(db, match: RankedMatch, user_id: str):
+    work = list(db.scalars(select(RankedWork).where(RankedWork.match_id == match.id, RankedWork.user_id == user_id)))
+    statuses = {}
+    for w in work:
+        if w.result and w.result["passed"] == len(PROBLEMS[w.problem_id]["cases"]):
+            statuses[w.problem_id] = "passed"
+        elif w.result:
+            statuses[w.problem_id] = "attempted"
+        else:
+            statuses[w.problem_id] = "not_started"
+    expected = sum(len(PROBLEMS[pid]["cases"]) for pid in match.problem_ids)
+    passed = sum(w.result["passed"] for w in work if w.result)
+    correctness = round(100 * passed / expected, 1) if expected else 0.0
+    return statuses, correctness
 
 
 @router.get("/matches/{match_id}")
-def get_match(match_id: str, request: Request, identity=Depends(auth.current_login)):
+async def get_match(match_id: str, request: Request, identity=Depends(auth.current_login)):
     with request.app.state.database.session.begin() as db:
         match = db.get(RankedMatch, match_id)
         if match is None:
             raise HTTPException(404, "Match not found")
         participant = _owned_participant(db, match_id, identity[0].id)
-        _finalize_if_ready(db, match)
+        results = _finalize_if_ready(db, match)
         opponent = db.scalar(select(RankedParticipant).where(RankedParticipant.match_id == match_id, RankedParticipant.user_id != identity[0].id))
-        return {
+        response = {
             "id": match.id, "status": match.status, "deadline": match.deadline, "finished_at": match.finished_at,
             "problems": [{k: PROBLEMS[pid][k] for k in ("id", "title", "category", "difficulty")} for pid in match.problem_ids],
             "my_outcome": participant.outcome, "my_rating_after": participant.rating_after,
             "opponent_outcome": opponent.outcome if opponent else None,
             "opponent_rating_after": opponent.rating_after if opponent else None,
         }
+    if results:
+        for user_id, payload in results.items():
+            await request.app.state.rooms.send_to_user(user_id, MatchResultEvent(payload=MatchResultPayload(**payload)))
+    return response
 
 
 @router.get("/history")
