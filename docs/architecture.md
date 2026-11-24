@@ -150,9 +150,9 @@ Keep practice rules and execution independent of room storage. A later paired in
 
 Integrate the existing GitHub Redis implementation deliberately before scaling chat workers. Redis Pub/Sub is live delivery without durable replay; do not use it as the only store for submissions or grades. Shared editing needs a conflict strategy beyond whole-draft last-writer updates. A trusted multiplayer assessment also needs a separate server-side execution service; current browser scores remain self-reported.
 
-## Ranked mode contract (draft, Phase 0)
+## Ranked mode contract (Phase 1 implemented; WS still draft)
 
-Not implemented. This is the Pydantic request/response contract for the two-player ranked NeetCode feature described in the project's Obsidian plan, published here so frontend work can start against a fixed shape before the backend lands, per the ownership rule above. Junze owns edits to this section; changes here should land before the dependent frontend/backend code, not after.
+The HTTP surface below is implemented on `ranked-mode` (`app/practice/ranked_routes.py`), reusing the existing account/CSRF/ownership patterns from `app/practice/routes.py`. Junze owns edits to this section; changes here should land before dependent frontend code, not after. No Render/production deployment of this is claimed — same disclaimer as the rest of this document.
 
 ### HTTP
 
@@ -162,21 +162,45 @@ Not implemented. This is the Pydantic request/response contract for the two-play
 {"categories": ["arrays", "graphs"], "difficulty": "mixed", "duration_minutes": 30, "problem_count": 2}
 ```
 
-Same field constraints as the existing solo `Settings` model (`duration_minutes` 5–180, `problem_count` 1–5, `categories` max 20). No `allow_overtime` or `problem_ids` field — ranked matches are always strict-deadline and always randomized (see "Open questions" in the Obsidian note on why overtime is excluded). Response, `202`:
+Same field constraints as the existing solo `Settings` model (`duration_minutes` 5–180, `problem_count` 1–5, `categories` max 20). No `allow_overtime` or `problem_ids` field — ranked matches are always strict-deadline and always randomized. Response, `202`, one of:
 
 ```json
 {"status": "queued", "queued_at": 1764012345.0}
+{"status": "matched", "match_id": "a1b2c3"}
 ```
 
-`DELETE /api/ranked/queue` — no body. `200` `{"status": "left"}`, or `409` `{"detail": "Already matched"}` if a match was found before the cancel was processed.
+Deviation from the original draft: a synchronous match returns only `match_id`, not the full opponent/deadline/problems payload — the client fetches those from `GET /api/ranked/matches/{id}` (added below) so there is one source of truth for match detail instead of two.
+
+`DELETE /api/ranked/queue` — no body. `200` `{"status": "left"}`, `404` if not queued, or `409` `{"detail": "Already matched"}` if a match was found before the cancel was processed.
+
+`GET /api/ranked/queue` — **new, not in the original draft.** Added because Phase 1 has no per-account WebSocket delivery yet (see "WebSocket" below), so a side that was already queued when the opponent's `POST` matched them has no other way to learn about it. Polling-based, consumes the pending-match notice on read:
+
+```json
+{"status": "idle"}
+{"status": "queued"}
+{"status": "matched", "match_id": "a1b2c3"}
+```
 
 `GET /api/ranked/rating` — `200`:
 
 ```json
-{"rating": 1000, "matches_played": 0, "tier": "Bronze"}
+{"rating": 1000, "matches_played": 0, "tier": "Gold"}
 ```
 
-`tier` is computed server-side from `rating` at response time (400-point bands) so the client never re-implements the tier boundaries; it is never stored.
+`tier` is computed server-side from `rating` at response time (400-point bands, floor `100`) so the client never re-implements the tier boundaries; it is never stored. Band edges: Bronze `100–499`, Silver `500–899`, Gold `900–1299`, Diamond `1300+`.
+
+`GET /api/ranked/matches/{match_id}` — **new.** Match detail for either participant; also the only place finalization is checked (see below). `404` for a match the caller isn't a participant in.
+
+```json
+{
+  "id": "a1b2c3", "status": "completed", "deadline": 1764013800.0, "finished_at": 1764013801.2,
+  "problems": [{"id": "two-sum", "title": "Two Sum", "category": "arrays", "difficulty": "easy"}],
+  "my_outcome": "win", "my_rating_after": 1016,
+  "opponent_outcome": "loss", "opponent_rating_after": 984
+}
+```
+
+`PUT /api/ranked/matches/{match_id}/work/{problem_id}` — **new.** Same shape as the solo `SaveWork` body (`code`, `revision`, optional `report`); same revision-precondition 409 on a stale save. Rejects a reported pass with `422` if the elapsed time since `match.started_at` is below `SUBMISSION_PLAUSIBILITY_FLOOR_SECONDS` (10s) — the anti-cheat floor from the Obsidian plan — and applies a ranked-specific submission rate limit (20/minute per account) separate from `auth.throttle`'s login-attempt limits.
 
 `GET /api/ranked/history` — `200`, same pagination shape (latest 30) as `GET /api/practice`:
 
@@ -184,20 +208,18 @@ Same field constraints as the existing solo `Settings` model (`duration_minutes`
 {
   "matches": [
     {
-      "id": "a1b2c3",
-      "opponent": "someuser",
-      "started_at": 1764012000.0,
-      "finished_at": 1764013800.0,
-      "outcome": "win",
-      "rating_before": 1000,
-      "rating_after": 1016,
-      "problems": [{"id": "two-sum", "title": "Two Sum", "category": "arrays", "difficulty": "easy"}]
+      "id": "a1b2c3", "opponent": "someuser", "started_at": 1764012000.0, "finished_at": 1764013800.0,
+      "outcome": "win", "rating_before": 1000, "rating_after": 1016
     }
   ]
 }
 ```
 
-### WebSocket (extends the existing `/ws` event union in `app/models.py`)
+Deviation from the original draft: no nested `problems` array — the caller already has that from `GET /api/ranked/matches/{id}` and duplicating it here would need another join per row for no new information.
+
+### WebSocket — still a draft, not implemented
+
+Deferred past Phase 1, not merely delayed by accident: the existing `RoomManager`/`RedisRoomManager` deliver by **room code**, with anonymous handles — there is no existing concept of "deliver to this account's socket wherever it is." Ranked mode needs exactly that (push a match found to a queued account before it has joined any room), which is new plumbing this phase didn't build. `GET /api/ranked/queue` polling stands in for `MATCH_FOUND` until that lands. The shapes below are the original Phase 0 draft, unchanged, and still the target once the per-account delivery problem is solved:
 
 `MATCH_FOUND` (server → both clients):
 
@@ -221,7 +243,11 @@ Never contains code, stdout, or per-case detail — see the trust-boundary note 
 
 ### Data model
 
-See the Obsidian plan's "Data model additions" table for `Rating` / `RankedMatch` / `RankedParticipant` / `RankedWork`; the ER shape added to this document's diagram above once the SQLAlchemy models land in `app/practice/database.py`.
+Implemented in `app/practice/database.py`: `Rating`, `RankedMatch`, `RankedParticipant`, `RankedWork`. One deviation from the Obsidian plan's drafted shape: `RankedWork`'s primary key is `(match_id, problem_id, user_id)`, not `(match_id, problem_id)` — the plan's table omitted `user_id`, but both participants solve the same `problem_id` in the same `match_id`, so without it one side's submission would overwrite the other's row.
+
+### Finalization
+
+Lazy, not event-driven: `GET /api/ranked/matches/{id}` checks `status == "active" and time.time() > deadline` on every read and runs the Elo update + both `Rating` writes in the same transaction if so, then flips `status` to `"completed"`. The status-guard read-then-write is single-process-safe for Phase 1; the Obsidian plan's Phase 2 section covers the additional Redis finalization lock needed once two workers can race this.
 
 ## Verification and remaining work
 

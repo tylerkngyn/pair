@@ -79,8 +79,12 @@ class RankedParticipant(Base):
 
 class RankedWork(Base):
     __tablename__ = "ranked_work"
+    # Keyed per-user too, unlike solo Work: both sides solve the same
+    # problem_id in the same match_id, so a (match_id, problem_id) row
+    # alone would let one side's submission overwrite the other's.
     match_id = Column(String(64), ForeignKey("ranked_matches.id"), primary_key=True)
     problem_id = Column(String(100), primary_key=True)
+    user_id = Column(String(64), ForeignKey("users.id"), primary_key=True)
     code = Column(String(50000), nullable=False, default="")
     result = Column(JSON)
     revision = Column(Integer, nullable=False, default=0)

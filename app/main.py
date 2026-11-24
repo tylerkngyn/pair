@@ -14,6 +14,7 @@ from pydantic import ValidationError
 from app.models import ChatEvent, JoinEvent, PingEvent, ReactionEvent, TypingEvent, client_event_adapter
 from app.room_manager import RoomManager
 from app.practice.database import Database
+from app.practice.ranked_routes import router as ranked_router
 from app.practice.routes import router as practice_router
 
 INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
@@ -49,6 +50,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Pair / interview practice", lifespan=lifespan)
 app.include_router(practice_router)
+app.include_router(ranked_router)
 app.mount("/assets", StaticFiles(directory=INDEX.parent / "practice"), name="assets")
 
 
