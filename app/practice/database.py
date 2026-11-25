@@ -2,8 +2,10 @@
 import os
 from pathlib import Path
 
-from sqlalchemy import Column, Float, ForeignKey, Integer, JSON, String, create_engine
+from sqlalchemy import Boolean, Column, Float, ForeignKey, Integer, JSON, String, create_engine, false
 from sqlalchemy.orm import declarative_base, sessionmaker
+
+from app.practice.migrations import upgrade
 
 Base = declarative_base()
 
@@ -77,6 +79,18 @@ class RankedParticipant(Base):
     outcome = Column(String(16))
 
 
+class MatchIntro(Base):
+    __tablename__ = "ranked_match_intros"
+    match_id = Column(String(64), ForeignKey("ranked_matches.id"), primary_key=True)
+    first_user_id = Column(String(64), ForeignKey("users.id"), nullable=False)
+    second_user_id = Column(String(64), ForeignKey("users.id"), nullable=False)
+    first_ready_at = Column(Float)
+    second_ready_at = Column(Float)
+    created_at = Column(Float, nullable=False)
+    scheduled_at = Column(Float)
+    cancelled_at = Column(Float)
+
+
 class RankedWork(Base):
     __tablename__ = "ranked_work"
     # Keyed per-user too, unlike solo Work: both sides solve the same
@@ -88,6 +102,35 @@ class RankedWork(Base):
     code = Column(String(50000), nullable=False, default="")
     result = Column(JSON)
     revision = Column(Integer, nullable=False, default=0)
+
+
+class Lobby(Base):
+    __tablename__ = "practice_lobbies"
+    code = Column(String(6), primary_key=True)
+    host_id = Column(String(64), ForeignKey("users.id"), nullable=False)
+    guest_id = Column(String(64), ForeignKey("users.id"))
+    settings = Column(JSON, nullable=False)
+    is_private = Column(Boolean, nullable=False, default=False, server_default=false())
+    status = Column(String(16), nullable=False, default="waiting")
+    created_at = Column(Float, nullable=False)
+    host_ready = Column(Integer, nullable=False, default=1)
+    guest_ready = Column(Integer, nullable=False, default=0)
+    match_id = Column(String(64), ForeignKey("ranked_matches.id"), unique=True)
+
+
+class LobbySeat(Base):
+    __tablename__ = "practice_lobby_seats"
+    user_id = Column(String(64), ForeignKey("users.id"), primary_key=True)
+    code = Column(String(6), ForeignKey("practice_lobbies.code"), nullable=False, index=True)
+    last_seen = Column(Float, nullable=False)
+
+
+class MatchFinish(Base):
+    __tablename__ = "ranked_match_finishes"
+    match_id = Column(String(64), ForeignKey("ranked_matches.id"), primary_key=True)
+    user_id = Column(String(64), ForeignKey("users.id"), primary_key=True)
+    state = Column(String(16), nullable=False)
+    finished_at = Column(Float, nullable=False)
 
 
 class Database:
@@ -111,6 +154,7 @@ class Database:
             elif self.engine.dialect.name == "postgresql":
                 connection.exec_driver_sql("SELECT pg_advisory_xact_lock(72417301)")
             Base.metadata.create_all(connection)
+            upgrade(connection)
             connection.commit()
         self.session = sessionmaker(self.engine, expire_on_commit=False)
 

@@ -1,14 +1,14 @@
 # Pair — interview practice architecture and ownership
 
-Updated November 24, 2026. This implementation is delivered on the `tyler` branch of [tylerkngyn/tylerjunze](https://github.com/tylerkngyn/tylerjunze/tree/tyler). The practice workspace was built from baseline `9229191` and integrated with `tyler` at `70fd5fa`, preserving its chat, typing indicators, and reactions. GitHub `main` at `16dc9b0` contains additional Redis room infrastructure that is not integrated into this branch. A GitHub push does not establish the state of the live Render deployment.
+Updated November 24, 2026. The `tyler` implementation builds on merged `main` at `93b198f`, including Redis transport and ranked matchmaking. This delivery adds public/private lobbies, the ranked product flow, shared lobby/ranked countdowns, unique online presence, and persistent cross-topic problem selection. The changes are recorded locally on `tyler`; no GitHub push or Render deployment is performed by this delivery.
 
 ## Product scope
 
-Pair is now a single-player, timed Python interview practice workspace. Users create a username/password account, choose NeetCode 150 topics and difficulty, select or randomize 1–5 problems, and set a 5–180 minute time budget. Overtime is optional and enabled by default. The default is one problem in 45 minutes.
+Pair supports timed solo Python practice, public two-player unranked lobbies with room codes, and ranked matchmaking. Users create a username/password account, choose NeetCode 150 topics and difficulty, select or randomize 1–5 problems, and set a 5–180 minute time budget. Solo overtime is optional and enabled by default. Multiplayer uses randomized problems and strict deadlines. The UI default is one problem in 45 minutes.
 
-The workspace includes a lightweight code editor, example execution, full practice-suite submission, account-scoped draft saving, session history, correctness results, and device-local efficiency comparisons. Two-player interviews, AI feedback, speech, explanations/readability scoring, and server-verified assessments are future work.
+The shared workspace includes a lightweight code editor, example execution, full practice-suite submission, private account-scoped drafts, history, correctness results, device-local efficiency comparisons, and aggregate opponent progress. AI feedback, speech, shared editing, explanations/readability scoring, and server-verified assessments are future work.
 
-The former word/image association prototype and its model, assets, data, tooling dependency file, and tests have been removed. The chat foundation is retained at `/chat` and `/ws` for future paired interviews.
+The former word/image association prototype and its model, assets, data, tooling dependency file, and tests have been removed. Legacy chat is retained at `/chat`; `/ws` also carries authenticated match notifications.
 
 ## Implemented architecture
 
@@ -27,7 +27,14 @@ flowchart TB
     P --> T[Correctness + invocation timing]
     T -->|Browser-reported result| U
     U -->|Save submission and code revision| S
-    U -. ranked mode: see the distributed-matchmaking diagram below .-> WS[WebSocket room/match layer]
+    U -->|Create, browse, join, ready, host start| L[Lobby API]
+    L <--> D
+    L --> M[Shared match lifecycle]
+    U -->|Find ranked opponent| Q[Memory or Redis queue]
+    Q --> M
+    M <--> D
+    M --> WS[Local or Redis WebSocket account delivery]
+    WS -->|Match, progress, result notifications| U
 ```
 
 FastAPI handles accounts, ownership, problem selection, session deadlines, draft versions, and result persistence. It does not execute submitted code. Execution is confined to the user's browser. This avoids operating a paid execution service and keeps CPU-bound user code out of the web-server process.
@@ -46,15 +53,18 @@ A real Chrome profile retained the old 1.9 KB CDN-based runner in its iframe dis
 | --- | --- | --- |
 | HTTP composition | `app/main.py` | Lifecycle, static files, API router, security headers, retained chat routes. |
 | Accounts | `app/practice/auth.py` | Registration/login/logout, password hashes, login-cookie sessions, CSRF/origin checks, attempt limits. |
-| Durable storage | `app/practice/database.py` | SQLAlchemy models and SQLite/PostgreSQL initialization. |
+| Durable storage | `app/practice/database.py`, `migrations.py` | SQLAlchemy models, SQLite/PostgreSQL initialization, idempotent upgrades under the startup schema lock. |
 | Practice orchestration | `app/practice/routes.py` | Selection validation, ownership, deadlines, draft revisions, results, history. |
+| Lobbies | `app/practice/lobby_routes.py` | Public list, six-character codes, two seats, readiness, host start, waiting-seat leases. |
+| Match orchestration | `app/practice/ranked_routes.py`, `ranked.py` | Queue endpoints, private participant work, match recovery, finish/forfeit, correctness/time outcomes, ranked Elo. |
+| Distributed queue | `app/practice/redis_ranked_queue.py` | Atomic Lua pairing, pending mailboxes, queue sweep, finalization lock. |
 | Problem metadata | `app/practice/catalog.json`, `catalog.py` | 150 entries with categories, difficulties, starter interfaces, pinned reference implementations. |
 | Practice content | `app/practice/exercises.py` | Original prompts, explicit expected outputs, larger deterministic cases, adapter/comparator choices. |
-| Workspace | `static/index.html`, `static/practice/app.js`, `styles.css` | Minimal grayscale UI, filtering, editor, timer, autosave, execution, results, history. |
+| Workspace | `static/index.html`, `static/practice/app.js`, `problem-map.js`, `multiplayer.js`, `styles.css` | Topic/problem node map, unique online counter, public/private lobby/search/loading views, shared editor/runner, results/history, bottom footer. |
 | Isolated execution | `static/practice/runner.html`, `harness.py` | Worker lifecycle, Python loading, function/design-class adapters, judging and timing. |
 | Runtime delivery | `static/practice/runtime-loader.js`, `runtime/314.0.8/**` | App-hosted core assets, byte progress, memory/HTTP cache, manifest, license/source notices. |
-| Retained chat | `static/chat.html`, `app/room_manager.py`, `app/models.py` | Existing two-person room protocol and local socket lifecycle. |
-| Tooling | `tools/import_neetcode.py`, `tools/browser_smoke.py` | Explicit catalog refresh and real-browser verification. |
+| Live transport | `app/room_manager.py`, `app/redis_room_manager.py`, `app/models.py`, `static/chat.html` | Account match notifications and retained two-person chat protocol. |
+| Tooling | `tools/import_neetcode.py`, `tools/browser_smoke.py`, `tools/browser_multiplayer_smoke.py` | Explicit catalog refresh, solo and two-account real-browser verification. |
 | Deployment | `requirements.txt`, `render.yaml`, `.env.example` | Python dependencies, single free web instance, documented database settings. |
 
 The editor intentionally stays lightweight: textarea-based with line numbers, indentation, and keyboard execution. There is no frontend framework, build pipeline, autocomplete service, or package-install console.
@@ -66,6 +76,13 @@ erDiagram
     USERS ||--o{ LOGINS : authenticates
     USERS ||--o{ PRACTICE_SESSIONS : owns
     PRACTICE_SESSIONS ||--o{ PRACTICE_WORK : contains
+    USERS ||--o| PRACTICE_LOBBY_SEATS : reserves
+    PRACTICE_LOBBIES ||--o{ PRACTICE_LOBBY_SEATS : contains
+    PRACTICE_LOBBIES |o--o| RANKED_MATCHES : starts
+    RANKED_MATCHES ||--o{ RANKED_PARTICIPANTS : has
+    RANKED_PARTICIPANTS ||--o{ RANKED_WORK : saves_private_code
+    RANKED_MATCHES ||--o{ RANKED_MATCH_FINISHES : locks_answers
+    RANKED_MATCHES ||--o| RANKED_MATCH_INTROS : coordinates_readiness
     USERS {
         string id PK
         string username UK
@@ -99,7 +116,7 @@ erDiagram
 
 Accounts use usernames rather than email; email verification, password reset, account deletion, and account migration between databases have not been implemented. Persistent storage is now authorized by the account requirement and replaces the original chat-only no-database constraint.
 
-Server-owned facts: user identity, ownership, selected problems, deadline, lifecycle, draft revision, stored code, and score arithmetic. Browser-reported facts: test outcomes and execution measurements. A user can inspect test data and alter browser reports. This is personal practice, not an anti-cheating judge. Schema/count validation does not convert a browser report into server-verified execution.
+Server-owned facts: user identity, ownership, selected problems, deadline, lobby seats/readiness, match lifecycle, draft revision, stored code, and score arithmetic. Browser-reported facts: test outcomes and execution measurements. A user can inspect test data and alter browser reports. Ranked ratings are practice ratings, not trusted assessments. Schema/count validation and the ranked ten-second submission floor do not establish genuine execution. Device-local runtime comparisons are displayed separately and do not decide ranked outcomes.
 
 ## Request flow
 
@@ -136,30 +153,59 @@ Use one owner per file. The following is the proposed ongoing split, not a claim
 
 | Owner | Owns | First follow-up work |
 | --- | --- | --- |
-| Tyler — practice experience and content | `static/index.html`, `static/practice/**`, `app/practice/exercises.py`, `catalog.py`, `catalog.json`, `NEETCODE_LICENSE.txt`, `tools/import_neetcode.py`, `tools/browser_smoke.py`, content/harness tests | Better editor interactions, richer prompts/fixtures, benchmark quality, report UX, accessibility. |
-| Junze — accounts, persistence, transport, deployment | `app/main.py`, `app/practice/auth.py`, `database.py`, `routes.py`, retained `app/models.py`/`room_manager.py`, `static/chat.html`, requirements, Render/env configuration, API/security/chat tests | Live PostgreSQL verification, migrations, recovery/account lifecycle, deployment configuration, Redis room integration and future multiplayer authorization. |
+| Tyler — practice experience and content | `static/index.html`, `static/practice/**` including `multiplayer.js`, `app/practice/exercises.py`, `catalog.py`, `catalog.json`, `NEETCODE_LICENSE.txt`, `tools/import_neetcode.py`, both browser smoke scripts, content/harness tests | Editor interactions, lobby/match UX, richer fixtures, benchmark quality, report UX, accessibility. |
+| Junze — accounts, persistence, transport, deployment | `app/main.py`, `app/practice/auth.py`, `database.py`, `migrations.py`, `routes.py`, `lobby_routes.py`, `ranked_routes.py`, `ranked.py`, `redis_ranked_queue.py`, `app/models.py`, both room managers, `static/chat.html`, requirements, Render/env configuration, API/security/transport tests | Live PostgreSQL verification, migrations, account lifecycle, queue/match atomicity, deployment configuration, Redis operational testing. |
 | Junze as documentation integrator; Tyler supplies content changes | `README.md`, `docs/architecture.md`, this Obsidian note | Keep the implemented/deployed distinction and ownership map current. |
 
 Move future harness/content tests into separate owner-specific files rather than editing one shared test module concurrently. The current combined `tests/practice/test_practice.py` is handed to Junze for API tests; Tyler should add content/harness tests in a new module when starting parallel work.
 
 Before parallel feature work, agree on Pydantic request/response schemas in `routes.py` and example JSON. Junze owns edits to shared API definitions; Tyler consumes that contract. Backend changes should preserve compatibility or land before the dependent frontend change. Do not have both developers edit `app/main.py`, requirements, or the same migration. Use separate feature branches and small PRs; one migration owner/sequence prevents database conflicts.
 
-## Multiplayer extension
+## Public lobbies and the product frontend — implemented
 
-Keep practice rules and execution independent of room storage. A later paired interview room should reference a persisted practice-session ID and explicit participant roles, not infer a leader from an unordered Redis hash. PostgreSQL remains the durable source for accounts, drafts, and reports. Redis can hold live membership/presence and deliver room events to each worker's local sockets.
+The setup UI switches between solo practice and Play together. Public open lobbies and room-code entry share the right-hand panel; new lobbies and ranked searches use the settings panel. Joining a lobby uses the host's settings. Layout width is centered and bounded, difficulty/timer/results use muted accents, transitions honor reduced motion, and a flex page shell keeps the attribution footer at the bottom of short views without covering long content.
 
-Integrate the existing GitHub Redis implementation deliberately before scaling chat workers. Redis Pub/Sub is live delivery without durable replay; do not use it as the only store for submissions or grades. Shared editing needs a conflict strategy beyond whole-draft last-writer updates. A trusted multiplayer assessment also needs a separate server-side execution service; current browser scores remain self-reported.
+The solo picker is a topic map. Choosing a topic (by node or dropdown) opens selectable problem nodes. Search filters problem nodes; selections update the configured count. One persistent selection set spans topic, search, and difficulty changes; a removable basket exposes the whole selection and topic nodes show selected counts. Only Random or explicit removal clears selections. Starting an explicit selection derives the request's category union and difficulty from the chosen IDs, so the API's existing filter validation accepts mixed categories/difficulties even when browsing a single topic. HTML buttons provide keyboard selection and `aria-pressed` state, with SVG category-membership edges behind them. Edges do not imply prerequisites. `problem-map.js` owns layout and selection rendering. Explanatory UI paragraphs have been removed; labels, problem content, run/save/connection states, and actionable errors remain.
 
-## Ranked mode contract (Phase 1 implemented; WS still draft)
+`Lobby` persists the host, optional guest, settings, ready flags, status, privacy flag, and resulting match ID. Creation accepts `is_private` (strict boolean, default false); the flag is returned separately from match filters. Public listing excludes private rows server-side. Private lobbies use the same member-only detail endpoints and can be joined by someone who knows the code. `LobbySeat` reserves one lobby per account and records heartbeat time. Conditional SQL updates claim the guest seat, change readiness, start once, and release seats. Both players must be ready and only the host can start; the host starts ready. Waiting seats expire after 120 seconds without polling: a missing host closes the lobby, while a missing guest frees the seat and clears readiness. Closed/full lobbies disappear from the public list. These are database-coordinated operations, independent of WebSocket worker affinity.
 
-The HTTP surface below is implemented on `ranked-mode` (`app/practice/ranked_routes.py`), reusing the existing account/CSRF/ownership patterns from `app/practice/routes.py`. Junze owns edits to this section; changes here should land before dependent frontend code, not after. No Render/production deployment of this is claimed — same disclaimer as the rest of this document.
+`GET /api/presence` returns `{"online": <count>}` to signed-in callers. Counts are unique authenticated accounts with active WebSockets; anonymous sockets are excluded and extra tabs are deduplicated. The local manager tracks all identified peers separately from its latest-socket delivery target. Redis stores one `user_id:peer_id` member per connection in the `online_users` sorted set, renews its score on the existing heartbeat (even without a room), and removes it on disconnect. Count reads atomically prune scores older than the presence lease (90 seconds by default) and deduplicate account IDs across workers. A crashed worker's connections therefore age out. The header polls roughly every five seconds and uses a green dot, or an unavailable indicator if a fetch fails.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /api/lobbies` | Latest 30 public waiting lobbies with an open seat. |
+| `GET /api/lobbies/current` | Resume the account's lobby and renew its seat. |
+| `POST /api/lobbies` | Create with the same `QueueFilters` fields as ranked search. |
+| `POST /api/lobbies/{code}/join` | Claim the second seat; case-insensitive code. |
+| `GET /api/lobbies/{code}` | Member-only state and heartbeat. |
+| `PUT /api/lobbies/{code}/ready` | Set `{"ready": true/false}`. |
+| `POST /api/lobbies/{code}/start` | Host-only, both ready; idempotently create one match. |
+| `DELETE /api/lobbies/{code}` | Guest leaves or host closes a waiting lobby. |
+
+Lobbies reuse `RankedMatch`/participants/private work through the common match orchestration; a linked lobby identifies an **unranked** match. Such matches calculate outcomes but leave both `Rating.rating` and `matches_played` unchanged. `MatchFinish` locks a participant's answers. Both finishes, a forfeit, or the deadline permit finalization; completed matches release lobby seats. Refresh recovers only the signed-in player's code and revisions, never the opponent's code.
+
+`multiplayer.js` handles lobby polling, code joins, ranked search/cancel, authenticated `/ws` notifications, HTTP fallback, match resume, opponent progress, finish/leave, and results/history. It reuses `app.js`'s workspace, editor, autosave queue, sandboxed Python runner, and report rendering. Lobby/match/queue polling runs every 1.8 seconds; public-list refresh runs about every five seconds while visible. Socket heartbeat is 20 seconds with reconnect attempts. HTTP state remains authoritative if a live notification is lost.
+
+An old waiting-lobby response is ignored once a match is opening/running; member polls also recheck the current room/view after each request. A delayed response from before the host's Start therefore cannot reopen the lobby and cancel the countdown.
+
+The search clock has a separate timeout scheduled at each elapsed-second boundary; slow API responses do not gate its rendering. Leaving search clears that timeout, and stale queue responses are ignored after a search changes or a match opens. Both new ranked pairings and host-started unranked lobbies create a `MatchIntro` row with the two account IDs, readiness timestamps, creation time, and optional scheduled/cancelled timestamps. Lobby readiness enables the host's Start button; client readiness then confirms actual problem loading/display on both devices. Match timestamps are provisional until both browsers acknowledge client readiness; the authoritative pending `intro.starts_at` is null. A conditional database update claims scheduling once, sets `started_at = now + 5s`, and preserves `deadline - started_at` as the full configured duration. Repeated/concurrent acknowledgements cannot restart the countdown. Work/Finish writes before readiness or `started_at` return 409; the existing ranked full-pass plausibility floor begins at actual play time. Explicit forfeits remain available.
+
+`openMatch` shows Connecting for at least 700ms and preloads the problems. It then shows both players' names (plus Elo/tier/ranked-match count for ranked games) for at least 1.2 seconds before calling `POST /api/ranked/matches/{id}/ready`. The mode badge reflects ranked versus unranked. The heading remains Match found until Starting in and never briefly inserts Waiting for opponent. It waits for both accounts rather than using a fixed creation-time window: that former seven-second window let a delayed browser skip versus entirely. Intro state is polled about every 800ms, independently from rendering the countdown. The last three seconds before the shared server start display 3–2–1; only then is either workspace mounted. A saved server-clock offset prevents preloading/intro time from skewing the workspace clock. Reloads reuse persisted readiness and continue the remaining countdown; reloads after start resume directly. An AbortController cancels intro waits and requests on sign-out or a completed/forfeited result, preventing an old intro from opening a stale workspace.
+
+If both acknowledgements do not arrive within 60 seconds of pairing/host start, the next match read claims cancellation and completion without changing Elo or ranked matches played, and unranked lobby seats are released. The UI/history label this Cancelled. Scheduling and cancellation compete through conditional updates of the same intro row, with the existing match status guard still protecting result finalization. A timed-out/absent browser therefore cannot leave its partner waiting indefinitely. `MatchIntro` is an additive table created at startup; old already-running matches without this row continue normally.
+
+The lobby/seat/finish tables are created at startup. `migrations.py` explicitly adds `practice_lobbies.is_private` to older databases under the existing startup lock; the default preserves existing lobbies as public. Repeated startups are safe. Restart the backend after updating. No account-data transfer or deployment is performed. A future cross-store reservation would further harden simultaneous ranked-queue and lobby actions from separate tabs; current routes check exclusion but Redis and SQL do not share an atomic transaction.
+
+## Ranked mode contract — implemented
+
+The HTTP surface below is implemented in `app/practice/ranked_routes.py`, reusing account/CSRF/ownership patterns from `app/practice/routes.py`. Junze owns ongoing API definitions; Tyler consumes them in the frontend. The root UI now uses this contract; `/ranked` remains a diagnostic page. No Render/production deployment is claimed.
 
 ### HTTP
 
 `POST /api/ranked/queue` — request:
 
 ```json
-{"categories": ["arrays", "graphs"], "difficulty": "mixed", "duration_minutes": 30, "problem_count": 2}
+{"categories": ["Arrays & Hashing", "Graphs"], "difficulty": "mixed", "duration_minutes": 30, "problem_count": 2}
 ```
 
 Same field constraints as the existing solo `Settings` model (`duration_minutes` 5–180, `problem_count` 1–5, `categories` max 20). No `allow_overtime` or `problem_ids` field — ranked matches are always strict-deadline and always randomized. Response, `202`, one of:
@@ -177,7 +223,7 @@ Deviation from the original draft: a synchronous match returns only `match_id`, 
 
 ```json
 {"status": "idle"}
-{"status": "queued"}
+{"status": "queued", "filters": {"categories": [], "difficulty": "mixed", "duration_minutes": 30, "problem_count": 1}, "queued_at": 1764012345.0}
 {"status": "matched", "match_id": "a1b2c3"}
 ```
 
@@ -202,7 +248,13 @@ Deviation from the original draft: a synchronous match returns only `match_id`, 
 }
 ```
 
-`PUT /api/ranked/matches/{match_id}/work/{problem_id}` — **new.** Same shape as the solo `SaveWork` body (`code`, `revision`, optional `report`); same revision-precondition 409 on a stale save. Rejects a reported pass with `422` if the elapsed time since `match.started_at` is below `SUBMISSION_PLAUSIBILITY_FLOOR_SECONDS` (10s) — the anti-cheat floor from the Obsidian plan — and applies a ranked-specific submission rate limit (20/minute per account) separate from `auth.throttle`'s login-attempt limits.
+Match detail additionally supplies `started_at`, `server_now`, own `work` (code/revision/result), own correctness/submission counts, opponent username/aggregate statuses/correctness, finish flags, `my_rating_before`, `is_ranked`, optional `lobby_code`, and `players.self`/`players.opponent` profiles (`username`, starting `rating`, `tier`, `matches_played`). New ranked and lobby matches include `intro: {ready_count, my_ready, starts_at, expires_at, cancelled}`. Only the caller's code is returned. `GET /api/ranked/active` returns `{"match": <detail or null>}` for refresh recovery and also checks finalization.
+
+`POST /api/ranked/matches/{match_id}/ready` — authenticated, CSRF-protected, participant-only. No body. Idempotently acknowledges that the caller has preloaded the workspace and shown versus; the second acknowledgement schedules the common start exactly once. Returns match detail. An expired pre-start intro cancels instead of scheduling a late match.
+
+`PUT /api/ranked/matches/{match_id}/work/{problem_id}` — same `SaveWork` body as solo (`code`, `revision`, optional `report`); 409 for stale revisions, own finished state, or an ended match. Ranked matches reject a reported full pass with 422 during the first ten seconds; unranked lobbies skip that floor. Submission writes have a separate 20/minute per-account rate limit. This is a replay deterrent, not trusted judging.
+
+`POST /api/ranked/matches/{match_id}/finish` — `{"forfeit": false}` by default locks the caller's answers; `true` explicitly concedes the match. Repeated requests are idempotent; a player waiting after Finish may still forfeit. Returns participant-owned match detail and checks finalization. Neither reload nor socket disconnect automatically forfeits a match.
 
 `GET /api/ranked/history` — `200`, same pagination shape (latest 30) as `GET /api/practice`:
 
@@ -211,7 +263,7 @@ Deviation from the original draft: a synchronous match returns only `match_id`, 
   "matches": [
     {
       "id": "a1b2c3", "opponent": "someuser", "started_at": 1764012000.0, "finished_at": 1764013800.0,
-      "outcome": "win", "rating_before": 1000, "rating_after": 1016
+      "outcome": "win", "rating_before": 1000, "rating_after": 1016, "is_ranked": true
     }
   ]
 }
@@ -234,7 +286,7 @@ Was the one deliberately deferred piece of Phase 1; now built. The gap was real,
 {"type": "match_found", "payload": {"match_id": "a1b2c3", "opponent": "someuser", "opponent_rating": 1042, "deadline": 1764013800.0, "problems": [{"id": "two-sum", "title": "Two Sum"}]}}
 ```
 
-`GET /api/ranked/queue` polling remains as a fallback for whenever delivery can't be confirmed (an unidentified socket, no socket open at all, or — see above — any push at all under `RedisRoomManager`, since it can't confirm delivery). `_PENDING_MATCH` is popped as soon as a push reports `True`, and separately, the queue's own "already matched" guard is a DB query (`_has_active_match`), not `_PENDING_MATCH` — the dict is purely a notification mailbox now; it must never also gate re-queueing, since it's expected to get cleared out from under an active match.
+`GET /api/ranked/queue` polling remains the fallback for unconfirmed delivery. Redis transport can confirm a local send through its acknowledgement key. `_PENDING_MATCH` is popped when a push reports `True`; the queue's "already matched" guard uses the database (`_has_active_match`), not this notification mailbox. The frontend also checks `/active` when a queue poll is idle, covering notifications already consumed by another tab.
 
 `OPPONENT_PROGRESS` (server → the opponent only, pushed from `PUT /api/ranked/matches/{id}/work/{problem_id}` on every submission with a report):
 
@@ -258,7 +310,7 @@ Implemented in `app/practice/database.py`: `Rating`, `RankedMatch`, `RankedParti
 
 ### Finalization
 
-Lazy, not event-driven: `GET /api/ranked/matches/{id}` checks `status == "active" and time.time() > deadline` on every read and runs the Elo update + both `Rating` writes in the same transaction if so, then flips `status` to `"completed"`. The status-guard read-then-write is single-process-safe for Phase 1; the Obsidian plan's Phase 2 section covers the additional Redis finalization lock still needed once two workers can race this — not yet built; see "Phase 2: distributed matchmaking" below for what has.
+Finalization is checked by match detail reads (including `/active` and the response to Finish). An active match becomes eligible after its deadline, after both participants finish, or after a forfeit. With Redis configured, the existing per-match lock precedes an atomic database `UPDATE ... WHERE status='active'` claim; the claim and results/rating changes commit in one transaction. Only the winning caller emits result notifications. Unranked outcomes skip rating/matches-played writes. With neither player connected, finalization waits until a later match/active read; there is no background deadline scheduler. A returning player can recover their match or result.
 
 ### Phase 2: distributed matchmaking — implemented
 
@@ -316,6 +368,8 @@ Solid arrows into Redis are only active once `REDIS_URL` is set; the dashed in-p
 
 ## Verification and remaining work
 
-The automated suite passes 197 tests covering the 150 reference implementations and starter failures, alternative outputs/deep-copy checks, account hashing/cookies/revocation/CSRF/limits, ownership isolation, stale revisions, score invalidation, configuration, deadlines/overtime, restart persistence, execution boundaries, bundled asset delivery, and retained chat lifecycle. With all external HTTP requests blocked, the real-browser workflow passes account creation/login/history, Run/Submit, runtime reuse, themes, mobile layout, opaque-origin isolation, Stop, and automatic execution timeout. Injected missing-asset and stalled-download checks also pass: controls recover, Stop cancels loading, and retry succeeds. The extended browser run passes every reference across all 150 problems and 460 fixtures using the app's real bundled files, without a test-only CDN replacement.
+The latest local suite passes 281 tests; three real Redis/multi-process integration tests are excluded by the default marker and were not rerun for the frontend integration. Coverage includes references/fixtures, accounts, private work, revisions, deadlines, socket delivery, fakeredis queue/finalization, lobby readiness/capacity, concurrent guest joins, stale seats, finish/forfeit, unranked Elo preservation, ranked recovery/results, private-code joins, schema-upgrade preservation, online counts/deduplication/expiry across simulated workers, shared readiness/scheduling (including concurrent/repeated acknowledgements) in ranked and lobby matches, late peers, full-duration/early-write guards, and no-rating-change cancellation/seat cleanup on connection timeout.
 
-No live PostgreSQL deployment, Render configuration change, cloud provisioning, multiplayer interview, or trusted judge is claimed. See the repository README for commands and exact execution limitations.
+The solo Chrome workflow passes cross-topic selection/navigation/filter persistence, starting the exact chosen mixed-category session, Run/Submit with app-only assets, runtime reuse, history/login, themes/mobile, isolated execution, Stop, and automatic execution timeout. The two-context Chrome workflow checks public/code joins, readiness/host start, real Python submission, private drafts, match refresh/progress, early unranked finish/results, ranked queue/cancel/refresh, per-second search updates during delayed network polling, Connecting/versus/stats/countdown, refresh during countdown without resetting the scheduled deadline, immediate resume after play begins, rating changes, and footer/mobile layout. `tools/browser_ranked_sync_smoke.py` runs ranked and `--lobby` modes, disables one client's WebSocket delivery, and delays its first match load by ten seconds. Lobby mode also returns a stale waiting-lobby response after Start. The checks require both versus screens, the same countdown/start/deadline/problems, no waiting-text heading flash, and workspace reveals within 500 ms of each other and the server start. The former creation-time warmup failed the delayed-client regression by opening the fast player's workspace early. The earlier extended runtime check covered all 150 references and 460 fixtures; it was not repeated for this UI change.
+
+No live PostgreSQL deployment, Render configuration change, cloud provisioning, or trusted judge is claimed. See the README for commands and execution limitations.

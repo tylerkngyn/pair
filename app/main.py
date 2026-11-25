@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from anyio import CancelScope
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
@@ -17,6 +17,7 @@ from app.practice import auth
 from app.practice.database import Database
 from app.practice.ranked_routes import router as ranked_router
 from app.practice.routes import router as practice_router
+from app.practice.lobby_routes import router as lobby_router
 
 INDEX = Path(__file__).resolve().parent.parent / "static" / "index.html"
 MAX_FRAME_CHARS = 8192
@@ -57,6 +58,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Pair / interview practice", lifespan=lifespan)
 app.include_router(practice_router)
 app.include_router(ranked_router)
+app.include_router(lobby_router)
 app.mount("/assets", StaticFiles(directory=INDEX.parent / "practice"), name="assets")
 
 
@@ -69,7 +71,7 @@ async def security_headers(request, call_next):
         response.headers["Cache-Control"] = "no-store"
     if request.url.path.startswith("/assets/runtime/314.0.8/"):
         response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
-    elif request.url.path in ("/", "/assets/app.js", "/assets/runtime-loader.js", "/assets/runner.html", "/assets/harness.py"):
+    elif request.url.path in ("/", "/assets/app.js", "/assets/problem-map.js", "/assets/multiplayer.js", "/assets/styles.css", "/assets/runtime-loader.js", "/assets/runner.html", "/assets/harness.py"):
         response.headers["Cache-Control"] = "no-cache"
     if request.url.path == "/assets/runner.html":
         response.headers["Content-Security-Policy"] = "default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' blob:; worker-src blob:; connect-src 'none'; frame-ancestors 'self'; sandbox allow-scripts"
@@ -90,16 +92,18 @@ async def legacy_chat():
 
 @app.get("/ranked", response_class=FileResponse)
 async def ranked_test_page():
-    """Manual test page for ranked mode: not part of the product UI, just
-    a thin client over the real /api/ranked/* + /ws contract so the backend
-    can be exercised by hand before Tyler builds the real frontend.
-    """
+    """Retained diagnostic client for the ranked HTTP/WebSocket contract."""
     return FileResponse(INDEX.with_name("ranked.html"))
 
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/api/presence")
+async def presence(request: Request, identity=Depends(auth.current_login)):
+    return {"online": await request.app.state.rooms.online_count()}
 
 
 @app.websocket("/ws")
@@ -111,9 +115,9 @@ async def websocket_endpoint(socket: WebSocket):
     # waiting for MATCH_FOUND. Best-effort: an absent/expired cookie just
     # leaves the peer anonymous, same as plain chat today.
     user, _login = auth.user_for_token(socket.app.state.database, socket.cookies.get(auth.COOKIE, ""))
-    if user is not None:
-        await manager.identify(peer, user.id)
     try:
+        if user is not None:
+            await manager.identify(peer, user.id)
         while True:
             # Browser pings keep an idle socket alive, joined or not — a
             # queued ranked player has no room yet but still needs to

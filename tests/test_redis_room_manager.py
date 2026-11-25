@@ -4,6 +4,7 @@ and capacity/handle checks are correct without real multi-process infra.
 """
 
 import asyncio
+import time
 
 import pytest
 from fakeredis import FakeServer
@@ -417,5 +418,40 @@ def test_disconnect_clears_user_identity(two_workers):
 
         assert delivered is False
         assert alice.socket.events == []
+
+    run_with_workers(worker_a, worker_b, scenario)
+
+
+def test_online_count_deduplicates_across_workers_and_tabs(two_workers):
+    worker_a, worker_b = two_workers
+
+    async def scenario():
+        alice, alice_tab, bob = [Peer(socket=FakeSocket()) for _ in range(3)]
+        await worker_a.identify(alice, 'alice')
+        await worker_b.identify(alice_tab, 'alice')
+        await worker_b.identify(bob, 'bob')
+        assert await worker_a.online_count() == 2
+        await worker_a.disconnect(alice)
+        assert await worker_a.online_count() == 2
+        await worker_b.disconnect(alice_tab)
+        assert await worker_b.online_count() == 1
+        await worker_b.disconnect(bob)
+        assert await worker_a.online_count() == 0
+
+    run_with_workers(worker_a, worker_b, scenario)
+
+
+def test_online_presence_expires_and_heartbeat_works_without_room(two_workers):
+    worker_a, worker_b = two_workers
+
+    async def scenario():
+        alice, bob = [Peer(socket=FakeSocket()) for _ in range(2)]
+        await worker_a.identify(alice, 'alice')
+        await worker_b.identify(bob, 'bob')
+        expired = time.time() - redis_room_manager.PRESENCE_TTL_SECONDS - 1
+        await worker_a._redis.zadd(redis_room_manager.ONLINE_KEY, {f'alice:{alice.id}':expired, f'bob:{bob.id}':expired})
+        await worker_a.heartbeat(alice)  # No chat room joined.
+        assert await worker_b.online_count() == 1
+        assert not await worker_a._redis.zscore(redis_room_manager.ONLINE_KEY, f'bob:{bob.id}')
 
     run_with_workers(worker_a, worker_b, scenario)

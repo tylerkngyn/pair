@@ -224,6 +224,9 @@ class RedisRankedQueue:
             result["opponent"] = _decode_opponent(result.pop("opponent_id"), result["opponent"])
         return result
 
+    async def contains(self, user_id: str) -> bool:
+        return bool(await self._redis.exists(self._meta_key(user_id)))
+
     async def mark_pending(self, user_id: str, match_id: str) -> None:
         """Called by the HTTP layer right after it creates a match from
         either join()'s or poll()'s "matched" result, for BOTH sides —
@@ -282,6 +285,8 @@ class RedisRankedQueue:
             # the match (same shape as the dict join()'s caller already
             # has for itself locally, but a poller doesn't have one).
             result["mine"] = _decode_opponent(user_id, result["mine"])
+        elif result["status"] == "queued":
+            result.update(filters=json.loads(own["filters"]), queued_at=float(own["queued_at"]))
         return result
 
     async def leave(self, user_id: str) -> bool:

@@ -1,6 +1,6 @@
 'use strict';
 const $ = id => document.getElementById(id);
-const views = ['account', 'setup', 'workspace', 'summary'];
+const views = ['account', 'setup', 'workspace', 'summary', 'lobby-view', 'queue-view', 'loading-view', 'match-intro'];
 let identity = null, catalog = [], session = null, problems = {}, active = null;
 let registering = false, selected = new Set(), draftTimer = null, saveQueue = Promise.resolve();
 let clock = null, clockOffset = 0, busy = false, runner = null, harness = null;
@@ -12,7 +12,11 @@ function element(tag, text, className) {
   return node;
 }
 function notice(message = '') { $('notice').textContent = message; $('notice').hidden = !message; }
-function show(view) { views.forEach(id => $(id).hidden = id !== view); notice(); }
+function show(view) {
+  if (view !== 'queue-view') stopSearchClock();
+  if (!['loading-view', 'match-intro', 'workspace'].includes(view)) cancelMatchIntro();
+  views.forEach(id => $(id).hidden = id !== view); document.body.dataset.view = view; notice();
+}
 function guard(action) { return async event => { try { await action(event); } catch (error) { notice(error.message || String(error)); } }; }
 async function api(path, options = {}) {
   const headers = { ...(options.body ? {'Content-Type': 'application/json'} : {}), ...(identity ? {'X-CSRF-Token': identity.csrf} : {}), ...options.headers };
@@ -20,11 +24,12 @@ async function api(path, options = {}) {
   const body = await response.json();
   if (!response.ok) {
     if (response.status === 401 && !path.startsWith('/auth/')) { runner?.stop(); identity = null; updateAccount(); show('account'); }
-    throw new Error(typeof body.detail === 'string' ? body.detail : body.detail?.[0]?.msg || 'Request failed');
+    const error = new Error(typeof body.detail === 'string' ? body.detail : body.detail?.[0]?.msg || 'Request failed');
+    error.status = response.status; throw error;
   }
   return body;
 }
-function updateAccount() { $('username').textContent = identity?.username || ''; $('signout').hidden = !identity; }
+function updateAccount() { $('username').textContent = identity?.username || ''; $('signout').hidden = !identity; $('online-users').hidden = !identity; }
 function theme(value) {
   document.documentElement.dataset.theme = value;
   $('theme').textContent = value === 'light' ? 'Dark' : 'Light';
@@ -52,6 +57,7 @@ $('account-form').onsubmit = guard(async event => {
   } finally { $('account-submit').disabled = false; }
 });
 $('signout').onclick = guard(async () => {
+  await stopMultiplayer();
   runner?.stop(); clearInterval(clock); clearTimeout(draftTimer);
   if (session && !$('workspace').hidden && !['completed', 'expired'].includes(session.status)) await flushDraft();
   await api('/auth/logout', {method:'POST'});
@@ -62,32 +68,37 @@ function filtered() {
   return catalog.filter(p => (!$('category').value || p.category === $('category').value) && ($('difficulty').value === 'mixed' || p.difficulty === $('difficulty').value));
 }
 function renderPicker() {
-  const available = filtered(), search = $('search').value.toLowerCase();
-  const list = $('problem-list'); list.replaceChildren();
-  for (const p of available.filter(p => `${p.title} ${p.number}`.toLowerCase().includes(search))) {
-    const label = element('label', undefined, 'problem-option'), input = document.createElement('input');
-    input.type = 'checkbox'; input.value = p.id; input.checked = selected.has(p.id);
-    input.onchange = () => { input.checked ? selected.add(p.id) : selected.delete(p.id); updateMatching(); };
-    label.append(input, element('span', p.title), element('small', p.difficulty)); list.append(label);
-  }
-  if (!list.children.length) list.append(element('p', 'No matching problems.', 'hint'));
+  renderProblemGraph(filtered(), $('search').value.trim().toLowerCase());
   updateMatching();
 }
-function updateMatching() { $('matching').textContent = `${filtered().length} available · ${selected.size ? `${selected.size} selected` : 'random selection'}`; }
-for (const id of ['category', 'difficulty']) $(id).onchange = () => { selected.clear(); renderPicker(); };
+function updateMatching() {
+  $('matching').textContent = selected.size ? `${selected.size} selected` : 'Random selection';
+  const basket = $('selected-problems'); basket.replaceChildren(); basket.hidden = !selected.size;
+  for (const pid of selected) {
+    const problem = catalog.find(p => p.id === pid);
+    const remove = element('button', `${problem.title} ×`, 'selected-problem'); remove.type = 'button';
+    remove.setAttribute('aria-label', `Remove ${problem.title}`);
+    remove.onclick = () => { selected.delete(pid); if (selected.size) $('problem-count').value = selected.size; renderPicker(); };
+    basket.append(remove);
+  }
+}
+for (const id of ['category', 'difficulty']) $(id).onchange = () => { $('difficulty').dataset.level = $('difficulty').value; renderPicker(); };
 $('search').oninput = renderPicker;
-$('randomize').onclick = () => { selected.clear(); renderPicker(); };
+$('randomize').onclick = () => { selected.clear(); renderPicker(); notice(); };
+$('graph-back').onclick = () => {
+  $('category').value = ''; $('search').value = ''; renderPicker();
+  $('problem-list').querySelector('button')?.focus({preventScroll:true});
+};
 async function setup() {
   runner?.stop(); clearInterval(clock); clearTimeout(draftTimer); session = null; active = null;
   if (!catalog.length) {
     catalog = (await api('/catalog')).problems;
     for (const category of new Set(catalog.map(p => p.category))) { const option = element('option', category); option.value = category; $('category').append(option); }
   }
-  show('setup'); renderPicker(); await renderHistory();
+  show('setup'); renderPicker(); await Promise.all([renderHistory(), multiplayerHome()]);
 }
 async function renderHistory() {
   const history = (await api('/practice')).sessions, list = $('history'); list.replaceChildren();
-  if (!history.length) list.append(element('p', 'Your sessions will appear here.', 'hint'));
   for (const s of history) {
     const row = element('button', undefined, 'history-row'); row.type = 'button';
     const title = element('span', s.problems.map(p => p.title).join(' / '));
@@ -95,14 +106,20 @@ async function renderHistory() {
     row.append(title, element('span', `${s.correctness}% · ${s.status}`));
     row.onclick = guard(() => openSession(s.id)); list.append(row);
   }
+  await renderMatchHistory(list);
+  if (!list.children.length) list.append(element('p', 'No sessions', 'hint'));
 }
 $('setup-form').onsubmit = guard(async event => {
   event.preventDefault(); notice();
+  if (playTogether) { if ($('join-code').value.trim()) await joinLobby(); else await createLobby(); return; }
   const count = Number($('problem-count').value);
   if (selected.size && selected.size !== count) throw new Error(`Select exactly ${count} problems, or choose Random.`);
+  const chosen = catalog.filter(p => selected.has(p.id));
+  const categories = chosen.length ? [...new Set(chosen.map(p => p.category))] : ($('category').value ? [$('category').value] : []);
+  const difficulty = chosen.length ? (chosen.every(p => p.difficulty === chosen[0].difficulty) ? chosen[0].difficulty : 'mixed') : $('difficulty').value;
   $('start').disabled = true;
   try {
-    const result = await api('/practice', {method:'POST', body:JSON.stringify({categories:$('category').value ? [$('category').value] : [], difficulty:$('difficulty').value, duration_minutes:Number($('duration').value), problem_count:count, allow_overtime:$('overtime').checked, problem_ids:[...selected]})});
+    const result = await api('/practice', {method:'POST', body:JSON.stringify({categories, difficulty, duration_minutes:Number($('duration').value), problem_count:count, allow_overtime:$('overtime').checked, problem_ids:[...selected]})});
     await openSession(result.id);
   } finally { $('start').disabled = false; }
 });
@@ -111,10 +128,18 @@ function draftKey(pid) { return `pair-draft:${identity.username}:${session.id}:$
 function localDraft(pid, code) { try { localStorage.setItem(draftKey(pid), JSON.stringify({code, revision:session.work[pid].revision})); } catch {} }
 function clearLocal(pid) { try { localStorage.removeItem(draftKey(pid)); } catch {} }
 async function openSession(id) {
+  $('again').textContent = 'New session';
+  showLoading('Loading workspace…');
+  try {
   session = await api(`/practice/${id}`);
-  clockOffset = session.server_now * 1000 - Date.now();
+  session.kind = 'solo';
+  await mountWorkspace();
+  } catch (error) { show('setup'); throw error; }
+}
+async function mountWorkspace(preloaded = null) {
+  clockOffset = session.clock_offset ?? session.server_now * 1000 - Date.now();
   if (!Number.isFinite(clockOffset)) clockOffset = 0;
-  const data = await Promise.all(session.problems.map(p => api(`/problems/${p.id}`)));
+  const data = preloaded || await Promise.all(session.problems.map(p => api(`/problems/${p.id}`)));
   problems = Object.fromEntries(data.map(p => [p.id, p]));
   for (const p of data) {
     try {
@@ -128,16 +153,16 @@ async function openSession(id) {
     const tab = element('button', `${i + 1}. ${p.title}`); tab.type = 'button'; tab.dataset.problem = p.id;
     tab.onclick = guard(async () => { if (active === p.id || busy) return; await flushDraft(); renderProblem(p.id); }); $('problem-tabs').append(tab);
   }
-  renderProblem(data[0].id); clearInterval(clock); clock = setInterval(tick, 500); tick();
+  renderProblem(data[0].id); renderOpponent(); clearInterval(clock); clock = setInterval(tick, 500); tick();
 }
 function renderProblem(pid) {
   active = pid; const p = problems[pid], work = session.work[pid];
   for (const tab of $('problem-tabs').children) tab.classList.toggle('selected', tab.dataset.problem === pid);
-  $('problem-meta').textContent = `${p.category} / ${p.difficulty}`; $('problem-title').textContent = p.title; $('prompt').textContent = p.prompt; $('problem-link').href = p.url;
+  $('problem-meta').replaceChildren(element('span', p.category), element('span', p.difficulty, `badge difficulty-${p.difficulty}`)); $('problem-title').textContent = p.title; $('prompt').textContent = p.prompt; $('problem-link').href = p.url;
   $('examples').replaceChildren();
   for (const c of p.cases.slice(0, 2)) $('examples').append(element('pre', `Input: ${JSON.stringify(c.args)}\nOutput: ${JSON.stringify(c.expected)}`, 'example'));
   $('editor').value = work.localCode ?? work.code; lines(); $('save-state').textContent = work.localCode !== undefined ? 'Unsaved draft restored' : 'Saved';
-  $('results').replaceChildren(element('p', 'Run examples to inspect output. Submit checks the full practice suite.', 'hint'));
+  $('results').replaceChildren();
   if (work.result) renderResults(work.result, true);
   lockControls();
 }
@@ -160,7 +185,7 @@ $('editor').onkeydown = event => {
 };
 function flushDraft(report = null, code = $('editor').value, pid = active) {
   clearTimeout(draftTimer);
-  if (!session || !pid || ['completed', 'expired'].includes(session.status)) return Promise.resolve();
+  if (!session || !pid || session.my_finished || ['completed', 'expired'].includes(session.status)) return Promise.resolve();
   const current = session, owner = identity?.username;
   const task = saveQueue.catch(() => {}).then(async () => {
     if (current !== session || owner !== identity?.username) return;
@@ -168,7 +193,8 @@ function flushDraft(report = null, code = $('editor').value, pid = active) {
     if (!report && work.code === code) return;
     $('save-state').textContent = 'Saving…';
     try {
-      const saved = await api(`/practice/${current.id}/work/${pid}`, {method:'PUT', body:JSON.stringify({code, revision:work.revision, ...(report ? {report} : {})})});
+      const prefix = current.kind === 'match' ? '/ranked/matches' : '/practice';
+      const saved = await api(`${prefix}/${current.id}/work/${pid}`, {method:'PUT', body:JSON.stringify({code, revision:work.revision, ...(report ? {report} : {})})});
       work.code = code; work.revision = saved.revision; work.result = saved.result;
       if (work.localCode === code) { delete work.localCode; clearLocal(pid); }
       else if (work.localCode !== undefined) localDraft(pid, work.localCode);
@@ -179,10 +205,11 @@ function flushDraft(report = null, code = $('editor').value, pid = active) {
 }
 $('reset').onclick = () => { if (busy || !$('editor').value || !confirm('Replace this draft with the starter code?')) return; $('editor').value = problems[active].starter; $('editor').oninput(); };
 function lockControls() {
-  const ended = !session || ['completed', 'expired'].includes(session.status);
+  const ended = !session || session.my_finished || ['completed', 'expired'].includes(session.status);
   for (const id of ['run', 'submit', 'reset']) $(id).disabled = busy || ended;
   $('editor').readOnly = busy || ended;
-  $('finish').disabled = busy;
+  $('finish').disabled = busy || Boolean(session?.my_finished);
+  $('finish').textContent = session?.kind === 'match' ? (session.my_finished ? 'Waiting for opponent' : 'Finish match') : 'Finish session';
   $('stop').hidden = !busy;
   for (const tab of $('problem-tabs').children) tab.disabled = busy;
 }
@@ -191,9 +218,11 @@ function tick() {
   const seconds = Math.ceil(session.deadline - (Date.now() + clockOffset) / 1000), overtime = seconds < 0;
   const absolute = Math.abs(seconds); $('timer').textContent = `${overtime ? '+' : ''}${Math.floor(absolute / 60).toString().padStart(2, '0')}:${(absolute % 60).toString().padStart(2, '0')}`;
   $('timer').title = overtime ? 'Overtime' : 'Time remaining';
+  $('timer').classList.toggle('timer-warning', seconds <= 300 && seconds > 60);
+  $('timer').classList.toggle('timer-danger', seconds <= 60);
   if (overtime && !session.settings.allow_overtime && session.status !== 'expired') {
     session.status = 'expired'; runner?.stop(); clearInterval(clock); lockControls();
-    notice('Time is up. Editing has stopped; your local draft is retained. Finish the session to view results.');
+    notice(session.kind === 'match' ? 'Time is up. Calculating the match result…' : 'Time is up. Editing has stopped; your local draft is retained. Finish the session to view results.');
   }
 }
 
@@ -239,7 +268,7 @@ class PythonRunner {
   }
 }
 async function execute(full) {
-  if (busy || !session || ['completed', 'expired'].includes(session.status)) return;
+  if (busy || !session || session.my_finished || ['completed', 'expired'].includes(session.status)) return;
   busy = true; lockControls(); notice();
   const pid = active, code = $('editor').value;
   try {
@@ -249,7 +278,7 @@ async function execute(full) {
     runner = new PythonRunner(); const result = await runner.run(problems[pid], code, full);
     renderResults(result, full);
     if (full) { await flushDraft(result, code, pid); $('execution-state').textContent = 'Submission saved.'; }
-    else $('execution-state').textContent = 'Examples finished. Submit to save a score.';
+    else $('execution-state').textContent = 'Examples complete.';
   } catch (error) { $('execution-state').textContent = error.message; throw error; }
   finally { busy = false; runner = null; lockControls(); }
 }
@@ -266,17 +295,19 @@ function renderResults(result, full) {
   correct.prepend(element('strong', `${result.passed} / ${result.total} passed`)); metrics.append(correct); root.append(metrics, element('p', timing(result), 'hint'));
   if (result.error) root.append(element('pre', result.error, 'output'));
   for (const [i, c] of result.cases.entries()) {
-    const details = element('details', undefined, 'case'); details.open = !c.passed;
+    const details = element('details', undefined, 'case'); details.open = !c.passed; details.dataset.passed = c.passed;
     details.append(element('summary', `${c.passed ? 'Passed' : 'Failed'} · case ${i + 1}`), element('pre', c.error || `Expected: ${c.expected}\nReceived: ${c.actual}`)); root.append(details);
   }
   if (result.stdout) root.append(element('h2', 'Output'), element('pre', result.stdout, 'output'));
 }
 $('finish').onclick = guard(async () => {
+  if (session?.kind === 'match') { await finishCurrentMatch(false); return; }
   if (!session || busy) return; await flushDraft(); clearInterval(clock);
   session = await api(`/practice/${session.id}/finish`, {method:'POST'}); showSummary();
 });
 function showSummary() {
   clearInterval(clock); show('summary');
+  $('summary-outcome').hidden = true;
   $('summary-score').textContent = `${session.correctness}% correctness`;
   $('summary-time').textContent = `${session.submitted} / ${session.problems.length} problems submitted · ${Math.max(0, Math.round(((session.finished_at || Math.min(Date.now() / 1000, session.deadline)) - session.started_at) / 60))} minutes`;
   $('summary-problems').replaceChildren();
@@ -291,6 +322,7 @@ function showSummary() {
     } catch {}
     const details = element('details'); details.append(element('summary', localReview ? 'Your code · unsaved local draft' : 'Your code'), element('pre', reviewCode)); item.append(details); $('summary-problems').append(item);
   }
+  if (session.kind === 'match') renderMatchSummary();
 }
 $('again').onclick = guard(setup);
 window.addEventListener('beforeunload', event => {

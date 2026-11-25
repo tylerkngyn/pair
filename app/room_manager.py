@@ -41,6 +41,7 @@ class RoomManager:
     def __init__(self) -> None:
         self._rooms: dict[str, Room] = {}
         self._users: dict[str, Peer] = {}
+        self._online_peers: set[Peer] = set()
 
     async def connect(self, socket: WebSocket) -> Peer:
         await socket.accept()
@@ -57,6 +58,10 @@ class RoomManager:
         """
         peer.user_id = user_id
         self._users[user_id] = peer
+        self._online_peers.add(peer)
+
+    async def online_count(self) -> int:
+        return len({peer.user_id for peer in self._online_peers})
 
     async def send_to_user(self, user_id: str, event: ServerEvent) -> bool:
         peer = self._users.get(user_id)
@@ -154,6 +159,7 @@ class RoomManager:
             )))
 
     async def disconnect(self, peer: Peer) -> None:
+        self._online_peers.discard(peer)
         if peer.user_id is not None and self._users.get(peer.user_id) is peer:
             del self._users[peer.user_id]
         code = peer.room

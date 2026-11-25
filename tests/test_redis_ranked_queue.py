@@ -120,9 +120,12 @@ def test_poll_with_no_match_available_stays_queued(two_workers):
     worker_a, worker_b = two_workers
 
     async def scenario():
-        await worker_a.join("alice", "alice", 1000, FILTERS)
+        joined = await worker_a.join("alice", "alice", 1000, FILTERS)
         polled = await worker_b.poll("alice")
         assert polled["status"] == "queued"
+        assert polled["filters"] == FILTERS
+        assert polled["queued_at"] == joined["queued_at"]
+        assert await worker_b.contains("alice")
 
     run(scenario)
 

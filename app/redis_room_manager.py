@@ -24,6 +24,7 @@ USER_CHANNEL_PREFIX = "user:"
 ACK_KEY_PREFIX = "ack:"
 ROOM_KEY_PREFIX = "room:"
 PRESENCE_KEY_PREFIX = "presence:"
+ONLINE_KEY = "online_users"
 ROOM_TTL_SECONDS = 3600  # Safety net only; rooms are deleted explicitly on empty.
 
 ACK_WAIT_SECONDS = float(os.environ.get("PAIR_ACK_WAIT_SECONDS", "0.5"))
@@ -148,6 +149,21 @@ class RedisRoomManager:
         """
         peer.user_id = user_id
         self._local_users[user_id] = peer
+        await self._touch_online(peer)
+
+    async def _touch_online(self, peer: Peer) -> None:
+        if peer.user_id is not None:
+            async with self._redis.pipeline(transaction=True) as pipe:
+                pipe.zadd(ONLINE_KEY, {f"{peer.user_id}:{peer.id}": time.time()})
+                pipe.expire(ONLINE_KEY, PRESENCE_TTL_SECONDS * 2)
+                await pipe.execute()
+
+    async def online_count(self) -> int:
+        async with self._redis.pipeline(transaction=True) as pipe:
+            pipe.zremrangebyscore(ONLINE_KEY, "-inf", time.time() - PRESENCE_TTL_SECONDS)
+            pipe.zrange(ONLINE_KEY, 0, -1)
+            _, members = await pipe.execute()
+        return len({member.split(":", 1)[0] for member in members})
 
     async def send_to_user(self, user_id: str, event) -> bool:
         """Publishes to every worker; only the one holding this user_id
@@ -219,6 +235,7 @@ class RedisRoomManager:
         return False
 
     async def heartbeat(self, peer: Peer) -> None:
+        await self._touch_online(peer)
         if peer.room is None:
             return
         await self._redis.set(
@@ -260,6 +277,8 @@ class RedisRoomManager:
         """
         if peer.user_id is not None and self._local_users.get(peer.user_id) is peer:
             del self._local_users[peer.user_id]
+        if peer.user_id is not None:
+            await self._redis.zrem(ONLINE_KEY, f"{peer.user_id}:{peer.id}")
         code = peer.room
         if code is None:
             return

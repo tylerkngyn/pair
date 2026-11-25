@@ -127,6 +127,14 @@ def test_cross_process_matchmaking_and_exactly_once_finalization(two_ranked_work
             else:
                 pytest.fail("Alice's process never learned about the match")
 
+            # Both browser clients finish loading/showing versus before the
+            # server schedules the shared start, regardless of worker affinity.
+            ready = await asyncio.gather(
+                alice.post(f"{base_a}/api/ranked/matches/{match_id}/ready", headers={"x-csrf-token":alice_csrf}),
+                bob.post(f"{base_b}/api/ranked/matches/{match_id}/ready", headers={"x-csrf-token":bob_csrf}),
+            )
+            assert all(response.status_code == 200 for response in ready)
+
             # Submit a real, correct, all-passing solution for alice so
             # there's an actual winner (not just a double-abandonment,
             # which the fakeredis-based test already covers in depth) —
@@ -136,7 +144,7 @@ def test_cross_process_matchmaking_and_exactly_once_finalization(two_ranked_work
             catalog = (await alice.get(f"{base_a}/api/catalog")).json()
             total = next(p["test_count"] for p in catalog["problems"] if p["id"] == problem_id)
             report = {"passed": total, "total": total, "cases": [{"passed": True}] * total}
-            submit_deadline = time.monotonic() + 15
+            submit_deadline = time.monotonic() + 25
             while time.monotonic() < submit_deadline:
                 submitted = await alice.put(
                     f"{base_a}/api/ranked/matches/{match_id}/work/{problem_id}",
@@ -145,7 +153,7 @@ def test_cross_process_matchmaking_and_exactly_once_finalization(two_ranked_work
                 )
                 if submitted.status_code == 200:
                     break
-                await asyncio.sleep(1)  # Waiting out the 10s submission-plausibility floor.
+                await asyncio.sleep(1)  # Warmup countdown, then the 10s submission floor.
             else:
                 pytest.fail(f"Alice's submission never succeeded: {submitted.status_code} {submitted.text}")
 

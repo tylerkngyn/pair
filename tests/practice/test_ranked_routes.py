@@ -1,4 +1,5 @@
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from fastapi.testclient import TestClient
@@ -8,7 +9,10 @@ from app.practice import ranked_routes
 
 
 @pytest.fixture(autouse=True)
-def clear_queue_state():
+def clear_queue_state(monkeypatch):
+    # Existing scoring/transport checks operate after the intro. Countdown
+    # behavior has its own tests below with the real warmup restored.
+    monkeypatch.setattr(ranked_routes, 'RANKED_WARMUP_SECONDS', 0)
     ranked_routes._QUEUE.clear()
     ranked_routes._PENDING_MATCH.clear()
     yield
@@ -87,6 +91,81 @@ def test_rating_defaults_and_tier(client):
     as_(client, alice)
     response = client.get("/api/ranked/rating")
     assert response.json() == {"rating": 1000, "matches_played": 0, "tier": "Gold"}
+
+
+def test_ranked_countdown_preserves_duration_and_blocks_early_work(client, monkeypatch):
+    monkeypatch.setattr(ranked_routes, 'RANKED_WARMUP_SECONDS', 7)
+    alice, bob, match_id = _match_two_players(client)
+    detail = client.get(f'/api/ranked/matches/{match_id}').json()
+    assert 5 < detail['started_at'] - detail['server_now'] <= 7
+    assert detail['deadline'] - detail['started_at'] == 30 * 60
+    assert detail['players']['self'] == {'username':'bob', 'rating':1000, 'tier':'Gold', 'matches_played':0}
+    assert detail['players']['opponent']['username'] == 'alice'
+    pid = detail['problems'][0]['id']
+    path = f'/api/ranked/matches/{match_id}/work/{pid}'
+    early = client.put(path, json={'code':'# early', 'revision':0})
+    assert early.status_code == 409 and 'countdown' in early.json()['detail']
+    first = as_(client, alice).post(f'/api/ranked/matches/{match_id}/ready').json()
+    assert first['intro']['ready_count'] == 1 and first['intro']['starts_at'] is None
+    scheduled = as_(client, bob).post(f'/api/ranked/matches/{match_id}/ready').json()
+    assert scheduled['intro']['ready_count'] == 2
+    assert scheduled['intro']['starts_at'] == scheduled['started_at']
+    assert scheduled['deadline'] - scheduled['started_at'] == 30 * 60
+    assert as_(client, alice).post(f'/api/ranked/matches/{match_id}/ready').json()['started_at'] == scheduled['started_at']
+    assert client.put(path, json={'code':'# still early', 'revision':0}).status_code == 409
+    with client.app.state.database.session.begin() as db:
+        db.get(ranked_routes.RankedMatch, match_id).started_at = time.time() - 1
+    assert client.put(path, json={'code':'# ready', 'revision':0}).status_code == 200
+
+
+def test_late_ranked_peer_still_gets_full_countdown(client, monkeypatch):
+    monkeypatch.setattr(ranked_routes, 'RANKED_WARMUP_SECONDS', 5)
+    alice, bob, mid = _match_two_players(client)
+    first = as_(client, alice).post(f'/api/ranked/matches/{mid}/ready').json()
+    with client.app.state.database.session.begin() as db:
+        # The original creation-time warmup has long since passed.
+        match = db.get(ranked_routes.RankedMatch, mid)
+        match.started_at -= 20; match.deadline -= 20
+    assert client.get(f'/api/ranked/matches/{mid}').json()['intro']['starts_at'] is None
+    scheduled = as_(client, bob).post(f'/api/ranked/matches/{mid}/ready').json()
+    assert 3 < scheduled['started_at'] - scheduled['server_now'] <= 5
+    assert scheduled['deadline'] - scheduled['started_at'] == 30 * 60
+    assert as_(client, alice).get(f'/api/ranked/matches/{mid}').json()['started_at'] == scheduled['started_at']
+
+
+def test_missing_ranked_peer_cancels_without_rating_change(client, monkeypatch):
+    monkeypatch.setattr(ranked_routes, 'RANKED_WARMUP_SECONDS', 5)
+    alice, bob, mid = _match_two_players(client)
+    path = f'/api/ranked/matches/{mid}'
+    as_(client, alice).post(path+'/ready')
+    outsider = register(client, 'outsider')
+    assert as_(client, outsider).post(path+'/ready').status_code == 404
+    with client.app.state.database.session.begin() as db:
+        db.get(ranked_routes.MatchIntro, mid).created_at -= 61
+    cancelled = as_(client, alice).get(path).json()
+    assert cancelled['status'] == 'completed' and cancelled['intro']['cancelled']
+    assert cancelled['my_rating_after'] == 1000
+    assert as_(client, bob).post(path+'/ready').json()['intro']['cancelled']
+    for who in (alice, bob):
+        rating = as_(client, who).get('/api/ranked/rating').json()
+        assert rating['rating'] == 1000 and rating['matches_played'] == 0
+
+
+def test_concurrent_ready_claims_schedule_only_once(client, monkeypatch):
+    monkeypatch.setattr(ranked_routes, 'RANKED_WARMUP_SECONDS', 5)
+    alice, bob, mid = _match_two_players(client)
+    path = f'/api/ranked/matches/{mid}'
+    def ready(who):
+        return client.post(path+'/ready', headers={'cookie':f'pair_session={who.cookie}', 'x-csrf-token':who.csrf})
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(ready, (alice, bob)))
+    assert all(response.status_code == 200 for response in responses)
+    scheduled = as_(client, alice).get(path).json()
+    assert scheduled['intro']['ready_count'] == 2 and scheduled['intro']['starts_at'] is not None
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        repeats = list(pool.map(ready, (alice, bob)))
+    assert all(response.json()['started_at'] == scheduled['started_at'] for response in repeats)
+    assert all(response.json()['deadline'] == scheduled['deadline'] for response in repeats)
 
 
 def _match_two_players(client):

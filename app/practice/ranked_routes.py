@@ -28,7 +28,7 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import Field
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -40,7 +40,7 @@ from app.models import (
 from app.practice import auth
 from app.practice.auth import token_hash
 from app.practice.catalog import PROBLEMS
-from app.practice.database import RateLimit, Rating, RankedMatch, RankedParticipant, RankedWork, User
+from app.practice.database import RateLimit, Rating, RankedMatch, RankedParticipant, RankedWork, User, Lobby, LobbySeat, MatchFinish, MatchIntro
 from app.practice.ranked import elo_update, match_outcome, tier
 from app.practice.routes import SaveWork, StrictModel
 
@@ -64,6 +64,8 @@ WINDOW_STEP = 25
 WINDOW_GROWTH_SECONDS = 5
 MAX_WINDOW = 400
 SUBMISSION_PLAUSIBILITY_FLOOR_SECONDS = 10
+RANKED_WARMUP_SECONDS = 5
+INTRO_CONNECT_TIMEOUT_SECONDS = 60
 
 
 class QueueFilters(StrictModel):
@@ -112,15 +114,19 @@ def _pick_problems(filters: QueueFilters) -> list[str]:
     return [p["id"] for p in random.SystemRandom().sample(available, filters.problem_count)]
 
 
-def _create_match(db, waiting: dict, incoming: dict) -> RankedMatch:
-    now = time.time()
+def _create_match(db, waiting: dict, incoming: dict, *, warmup_seconds: float = 0) -> RankedMatch:
+    created_at = time.time()
+    starts_at = created_at + warmup_seconds
     problem_ids = _pick_problems(QueueFilters(**incoming["filters"]))
     match = RankedMatch(
-        id=secrets.token_hex(16), problem_ids=problem_ids, started_at=now,
-        deadline=now + incoming["filters"]["duration_minutes"] * 60, status="active",
+        id=secrets.token_hex(16), problem_ids=problem_ids, started_at=starts_at,
+        deadline=starts_at + incoming["filters"]["duration_minutes"] * 60, status="active",
     )
     db.add(match)
     db.flush()
+    if warmup_seconds > 0:
+        db.add(MatchIntro(match_id=match.id, first_user_id=waiting["user_id"],
+            second_user_id=incoming["user_id"], created_at=created_at))
     for entry in (waiting, incoming):
         db.add(RankedParticipant(match_id=match.id, user_id=entry["user_id"], rating_before=entry["rating"]))
         for pid in problem_ids:
@@ -176,7 +182,7 @@ async def _match_and_push(request: Request, waiting: dict, incoming: dict, db):
     assuming only one of them is actually in _QUEUE.
     """
     _QUEUE[:] = [e for e in _QUEUE if e is not waiting and e is not incoming]
-    match = _create_match(db, waiting, incoming)
+    match = _create_match(db, waiting, incoming, warmup_seconds=RANKED_WARMUP_SECONDS)
     _PENDING_MATCH[waiting["user_id"]] = match.id
     _PENDING_MATCH[incoming["user_id"]] = match.id
     return _match_info(match)
@@ -204,6 +210,12 @@ async def _push_match_found(request: Request, match_info: dict, a: dict, b: dict
 @router.post("/queue", status_code=202)
 async def join_queue(filters: QueueFilters, request: Request, identity=Depends(auth.authenticated_write)):
     user = identity[0]
+    _pick_problems(filters)
+    with request.app.state.database.session.begin() as db:
+        from app.practice.lobby_routes import cleanup
+        cleanup(db)
+        if db.get(LobbySeat, user.id):
+            raise HTTPException(409, "Leave your lobby before joining ranked matchmaking")
     redis_queue = _redis_queue(request)
     if redis_queue is not None:
         return await _join_redis(request, redis_queue, user, filters)
@@ -249,7 +261,7 @@ async def _join_redis(request: Request, redis_queue, user, filters: QueueFilters
         if result["status"] == "queued":
             return {"status": "queued", "queued_at": result["queued_at"]}
         opponent = result["opponent"]
-        match_info = _match_info(_create_match(db, opponent, incoming))
+        match_info = _match_info(_create_match(db, opponent, incoming, warmup_seconds=RANKED_WARMUP_SECONDS))
     await redis_queue.mark_pending(opponent["user_id"], match_info["match_id"])
     await redis_queue.mark_pending(user.id, match_info["match_id"])
     await _push_match_found(request, match_info, incoming, opponent, redis_queue)
@@ -306,7 +318,7 @@ async def _poll_in_process(request: Request, user_id: str):
         # the retry here needs no new background task.
         opponent_entry = _find_opponent(mine)
         if opponent_entry is None:
-            return {"status": "queued"}
+            return {"status": "queued", "filters": mine["filters"], "queued_at": mine["queued_at"]}
         with request.app.state.database.session.begin() as db:
             match_info = await _match_and_push(request, opponent_entry, mine, db)
     await _push_match_found(request, match_info, mine, opponent_entry)
@@ -324,7 +336,7 @@ async def _poll_redis(request: Request, redis_queue, user_id: str):
     # script's own "mine" field rather than being freshly built here.
     opponent, mine = result["opponent"], result["mine"]
     with request.app.state.database.session.begin() as db:
-        match_info = _match_info(_create_match(db, opponent, mine))
+        match_info = _match_info(_create_match(db, opponent, mine, warmup_seconds=RANKED_WARMUP_SECONDS))
     await redis_queue.mark_pending(opponent["user_id"], match_info["match_id"])
     await redis_queue.mark_pending(user_id, match_info["match_id"])
     await _push_match_found(request, match_info, mine, opponent, redis_queue)
@@ -368,13 +380,26 @@ async def _finalize_if_ready(db, match: RankedMatch, redis_queue=None):
         return None
     # Checked before the lock and the expensive per-problem queries below:
     # no reason to take a 10-second lock, or do any of that work, for a
-    # match that isn't actually ready yet. (Early "both sides confirmed
-    # ready" finalization is deferred past Phase 1 — only the deadline
-    # passing finalizes a match.)
-    if time.time() <= match.deadline:
+    # match that isn't ready. A deadline, two finishes, or a forfeit
+    # triggers finalization.
+    finishes = list(db.scalars(select(MatchFinish).where(MatchFinish.match_id == match.id)))
+    forfeits = {f.user_id for f in finishes if f.state == "forfeit"}
+    intro = db.get(MatchIntro, match.id)
+    connecting = intro is not None and intro.scheduled_at is None and not forfeits
+    if connecting and time.time() < intro.created_at + INTRO_CONNECT_TIMEOUT_SECONDS:
+        return None
+    if not connecting and time.time() <= match.deadline and len(finishes) < 2 and not forfeits:
         return None
     if redis_queue is not None and not await redis_queue.acquire_finalize_lock(match.id, _WORKER_ID):
         return None
+    cancelled = False
+    if connecting:
+        cancelled = db.execute(update(MatchIntro).where(MatchIntro.match_id == match.id,
+            MatchIntro.scheduled_at.is_(None), MatchIntro.cancelled_at.is_(None),
+            MatchIntro.created_at <= time.time() - INTRO_CONNECT_TIMEOUT_SECONDS
+        ).values(cancelled_at=time.time())).rowcount == 1
+        if not cancelled:  # The other player scheduled the start concurrently.
+            return None
     # The actual DB-side transition guard: an atomic conditional UPDATE,
     # not an ORM attribute set applied later. Claiming the transition
     # BEFORE computing or writing any Elo/Rating changes means a losing
@@ -389,6 +414,10 @@ async def _finalize_if_ready(db, match: RankedMatch, redis_queue=None):
         .values(status="completed", finished_at=now)
     )
     if claimed.rowcount != 1:
+        if cancelled:
+            # A concurrent forfeit won finalization; preserve its outcome.
+            db.execute(update(MatchIntro).where(MatchIntro.match_id == match.id).values(cancelled_at=None))
+            db.refresh(match)
         return None
     match.status, match.finished_at = "completed", now
     participants = list(db.scalars(select(RankedParticipant).where(RankedParticipant.match_id == match.id)))
@@ -399,11 +428,18 @@ async def _finalize_if_ready(db, match: RankedMatch, redis_queue=None):
         statuses, correctness = _problem_statuses_and_correctness(db, match, participant.user_id)
         work = list(db.scalars(select(RankedWork).where(RankedWork.match_id == match.id, RankedWork.user_id == participant.user_id)))
         last_submit = max((w.result["submitted_at"] for w in work if w.result), default=match.deadline)
-        attempted = any(status != "not_started" for status in statuses.values())
+        attempted = any(status != "not_started" for status in statuses.values()) and participant.user_id not in forfeits
         work_by_user[participant.user_id] = {"correctness": correctness, "elapsed": last_submit - match.started_at, "attempted": attempted}
     a, b = participants
     a_info, b_info = work_by_user[a.user_id], work_by_user[b.user_id]
-    if not a_info["attempted"] and not b_info["attempted"]:
+    if cancelled:
+        outcome_a = outcome_b = "draw"
+        new_a, new_b = a.rating_before, b.rating_before
+    elif forfeits and len(forfeits) == 1:
+        loser = a.user_id in forfeits
+        outcome_a, outcome_b = ("abandoned", "win") if loser else ("win", "abandoned")
+        new_a, new_b = elo_update(a.rating_before, b.rating_before, 0, 0, 0.0 if loser else 1.0)
+    elif not a_info["attempted"] and not b_info["attempted"]:
         # Double no-show: neither side ever submitted anything. Not a draw
         # — the plan says abandoning is a loss for the abandoning side, and
         # with no one left to call a winner there's no zero-sum pair to run
@@ -423,6 +459,11 @@ async def _finalize_if_ready(db, match: RankedMatch, redis_queue=None):
         outcome_a, score_a = match_outcome(a_info["correctness"], b_info["correctness"], a_info["elapsed"], b_info["elapsed"])
         outcome_b = {"win": "loss", "loss": "win", "draw": "draw"}[outcome_a]
         new_a, new_b = elo_update(a.rating_before, b.rating_before, 0, 0, score_a)
+    lobby = db.scalar(select(Lobby).where(Lobby.match_id == match.id))
+    unranked = lobby is not None
+    if unranked:
+        new_a, new_b = a.rating_before, b.rating_before
+        db.execute(delete(LobbySeat).where(LobbySeat.code == lobby.code))
     results = {}
     for participant, opponent, outcome, new_rating, opponent_new_rating in (
         (a, b, outcome_a, new_a, new_b),
@@ -430,10 +471,11 @@ async def _finalize_if_ready(db, match: RankedMatch, redis_queue=None):
     ):
         participant.outcome = outcome
         participant.rating_after = new_rating
-        rating_row = _get_or_create_rating(db, participant.user_id)
-        rating_row.rating = new_rating
-        rating_row.matches_played += 1
-        rating_row.updated_at = now
+        if not unranked and not cancelled:
+            rating_row = _get_or_create_rating(db, participant.user_id)
+            rating_row.rating = new_rating
+            rating_row.matches_played += 1
+            rating_row.updated_at = now
         results[participant.user_id] = {
             "outcome": outcome, "my_correctness": work_by_user[participant.user_id]["correctness"],
             "opponent_correctness": work_by_user[opponent.user_id]["correctness"],
@@ -474,6 +516,11 @@ async def save_ranked_work(match_id: str, problem_id: str, body: SaveWork, reque
             raise HTTPException(404, "Problem is not in this match")
         if match.status != "active" or time.time() > match.deadline:
             raise HTTPException(409, "This match has ended")
+        intro = db.get(MatchIntro, match_id)
+        if (intro is not None and intro.scheduled_at is None) or time.time() < match.started_at:
+            raise HTTPException(409, "Match countdown is still running")
+        if db.get(MatchFinish, (match_id, user_id)):
+            raise HTTPException(409, "You have finished this match")
         work = db.get(RankedWork, (match_id, problem_id, user_id))
         report = body.report
         result = work.result if work.code == body.code else None
@@ -488,7 +535,8 @@ async def save_ranked_work(match_id: str, problem_id: str, body: SaveWork, reque
             # anti-cheat section. This never proves a submission is genuine;
             # it only rejects the cheapest replay attempts.
             elapsed = time.time() - match.started_at
-            if report.passed == count and elapsed < SUBMISSION_PLAUSIBILITY_FLOOR_SECONDS:
+            is_ranked = db.scalar(select(Lobby.code).where(Lobby.match_id == match_id)) is None
+            if is_ranked and report.passed == count and elapsed < SUBMISSION_PLAUSIBILITY_FLOOR_SECONDS:
                 raise HTTPException(422, "Submitted implausibly fast after the match started")
             result = report.model_dump() | {"source": "browser_practice", "submitted_at": time.time()}
         changed = db.execute(update(RankedWork).where(
@@ -535,12 +583,42 @@ async def get_match(match_id: str, request: Request, identity=Depends(auth.curre
         participant = _owned_participant(db, match_id, identity[0].id)
         results = await _finalize_if_ready(db, match, _redis_queue(request))
         opponent = db.scalar(select(RankedParticipant).where(RankedParticipant.match_id == match_id, RankedParticipant.user_id != identity[0].id))
+        own_work = list(db.scalars(select(RankedWork).where(RankedWork.match_id == match_id, RankedWork.user_id == identity[0].id)))
+        statuses, correctness = _problem_statuses_and_correctness(db, match, identity[0].id)
+        opposite_statuses, opposite_correctness = _problem_statuses_and_correctness(db, match, opponent.user_id) if opponent else ({}, 0)
+        lobby = db.scalar(select(Lobby).where(Lobby.match_id == match_id))
+        intro = db.get(MatchIntro, match_id)
+        intro_state = None
+        if intro is not None:
+            intro_state = {"ready_count": int(intro.first_ready_at is not None) + int(intro.second_ready_at is not None),
+                "my_ready": (intro.first_ready_at if identity[0].id == intro.first_user_id else intro.second_ready_at) is not None,
+                "starts_at": match.started_at if intro.scheduled_at is not None else None,
+                "expires_at": intro.created_at + INTRO_CONNECT_TIMEOUT_SECONDS,
+                "cancelled": intro.cancelled_at is not None}
+        players = {}
+        for side, player in (("self", participant), ("opponent", opponent)):
+            if player is not None:
+                rating = db.get(Rating, player.user_id)
+                players[side] = {"username": db.get(User, player.user_id).username,
+                    "rating": player.rating_before, "tier": tier(player.rating_before),
+                    "matches_played": rating.matches_played if rating else 0}
         response = {
             "id": match.id, "status": match.status, "deadline": match.deadline, "finished_at": match.finished_at,
             "problems": [{k: PROBLEMS[pid][k] for k in ("id", "title", "category", "difficulty")} for pid in match.problem_ids],
             "my_outcome": participant.outcome, "my_rating_after": participant.rating_after,
             "opponent_outcome": opponent.outcome if opponent else None,
             "opponent_rating_after": opponent.rating_after if opponent else None,
+            "started_at": match.started_at, "server_now": time.time(), "correctness": correctness,
+            "submitted": sum(w.result is not None for w in own_work),
+            "work": {w.problem_id: {"code": w.code, "revision": w.revision, "result": w.result} for w in own_work},
+            "opponent": db.get(User, opponent.user_id).username if opponent else None,
+            "opponent_correctness": opposite_correctness, "opponent_statuses": opposite_statuses,
+            "my_rating_before": participant.rating_before, "is_ranked": lobby is None,
+            "my_finished": db.get(MatchFinish, (match_id, identity[0].id)) is not None,
+            "opponent_finished": db.get(MatchFinish, (match_id, opponent.user_id)) is not None if opponent else False,
+            "lobby_code": lobby.code if lobby else None,
+            "players": players,
+            "intro": intro_state,
         }
     if results:
         for user_id, payload in results.items():
@@ -548,21 +626,85 @@ async def get_match(match_id: str, request: Request, identity=Depends(auth.curre
     return response
 
 
+@router.post("/matches/{match_id}/ready")
+async def match_ready(match_id: str, request: Request, identity=Depends(auth.authenticated_write)):
+    with request.app.state.database.session.begin() as db:
+        match = db.get(RankedMatch, match_id)
+        _owned_participant(db, match_id, identity[0].id)
+        intro = db.get(MatchIntro, match_id)
+        if match is None or intro is None:
+            raise HTTPException(404, "Match intro not found")
+        if match.status == "active":
+            now = time.time()
+            ready_column = MatchIntro.first_ready_at if identity[0].id == intro.first_user_id else MatchIntro.second_ready_at
+            db.execute(update(MatchIntro).where(MatchIntro.match_id == match_id,
+                MatchIntro.scheduled_at.is_(None), MatchIntro.cancelled_at.is_(None),
+                MatchIntro.created_at > now - INTRO_CONNECT_TIMEOUT_SECONDS
+            ).values({ready_column:func.coalesce(ready_column, now)}))
+            claimed = db.execute(update(MatchIntro).where(MatchIntro.match_id == match_id,
+                MatchIntro.first_ready_at.is_not(None), MatchIntro.second_ready_at.is_not(None),
+                MatchIntro.scheduled_at.is_(None), MatchIntro.cancelled_at.is_(None),
+                MatchIntro.created_at > now - INTRO_CONNECT_TIMEOUT_SECONDS
+            ).values(scheduled_at=now))
+            if claimed.rowcount == 1:
+                duration = match.deadline - match.started_at
+                changed = db.execute(update(RankedMatch).where(RankedMatch.id == match_id, RankedMatch.status == "active")
+                    .values(started_at=now + RANKED_WARMUP_SECONDS, deadline=now + RANKED_WARMUP_SECONDS + duration))
+                if changed.rowcount != 1:
+                    raise HTTPException(409, "Match already ended")
+    return await get_match(match_id, request, identity)
+
+
+class FinishMatch(StrictModel):
+    forfeit: bool = False
+
+
+@router.post("/matches/{match_id}/finish")
+async def finish_match(match_id: str, body: FinishMatch, request: Request, identity=Depends(auth.authenticated_write)):
+    with request.app.state.database.session.begin() as db:
+        match = db.get(RankedMatch, match_id)
+        if match is None:
+            raise HTTPException(404, "Match not found")
+        _owned_participant(db, match_id, identity[0].id)
+        intro = db.get(MatchIntro, match_id)
+        if match.status == "active" and not body.forfeit and intro is not None and (intro.scheduled_at is None or time.time() < match.started_at):
+            raise HTTPException(409, "Match countdown is still running")
+        insert = sqlite_insert if db.bind.dialect.name == "sqlite" else postgres_insert
+        if match.status == "active":
+            statement = insert(MatchFinish).values(match_id=match_id, user_id=identity[0].id,
+                state="forfeit" if body.forfeit else "finished", finished_at=time.time())
+            statement = statement.on_conflict_do_update(index_elements=[MatchFinish.match_id, MatchFinish.user_id], set_={"state":"forfeit"}) if body.forfeit else statement.on_conflict_do_nothing()
+            db.execute(statement)
+    return await get_match(match_id, request, identity)
+
+
+@router.get("/active")
+async def active_match(request: Request, identity=Depends(auth.current_login)):
+    with request.app.state.database.session() as db:
+        match_id = db.scalar(select(RankedParticipant.match_id).join(RankedMatch, RankedMatch.id == RankedParticipant.match_id)
+            .where(RankedParticipant.user_id == identity[0].id, RankedMatch.status == "active")
+            .order_by(RankedMatch.started_at.desc()).limit(1))
+    return {"match": await get_match(match_id, request, identity) if match_id else None}
+
+
 @router.get("/history")
 def history(request: Request, identity=Depends(auth.current_login)):
     with request.app.state.database.session() as db:
         mine = list(db.scalars(
-            select(RankedParticipant).where(RankedParticipant.user_id == identity[0].id)
-            .order_by(RankedParticipant.match_id.desc()).limit(30)
+            select(RankedParticipant).join(RankedMatch, RankedMatch.id == RankedParticipant.match_id).where(RankedParticipant.user_id == identity[0].id)
+            .order_by(RankedMatch.started_at.desc()).limit(30)
         ))
         matches = []
         for participant in mine:
             opponent = db.scalar(select(RankedParticipant).where(RankedParticipant.match_id == participant.match_id, RankedParticipant.user_id != identity[0].id))
             opponent_user = db.get(User, opponent.user_id) if opponent else None
             match = db.get(RankedMatch, participant.match_id)
+            intro = db.get(MatchIntro, match.id)
             matches.append({
                 "id": match.id, "started_at": match.started_at, "finished_at": match.finished_at,
                 "opponent": opponent_user.username if opponent_user else None,
                 "outcome": participant.outcome, "rating_before": participant.rating_before, "rating_after": participant.rating_after,
+                "is_ranked": db.scalar(select(Lobby.code).where(Lobby.match_id == match.id)) is None,
+                "cancelled": intro is not None and intro.cancelled_at is not None,
             })
         return {"matches": matches}

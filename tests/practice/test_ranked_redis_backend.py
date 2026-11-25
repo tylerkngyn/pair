@@ -23,7 +23,8 @@ FILTERS = {"categories": [], "difficulty": "mixed", "duration_minutes": 30, "pro
 
 
 @pytest.fixture
-def client():
+def client(monkeypatch):
+    monkeypatch.setattr(ranked_routes, 'RANKED_WARMUP_SECONDS', 0)
     with TestClient(app) as c:
         # Exposed so a test can build a second RedisRankedQueue against the
         # same backing store, simulating a second worker racing the first.
@@ -83,6 +84,25 @@ def test_double_join_rejected_over_redis_backend(client):
     as_(client, alice)
     client.post("/api/ranked/queue", json=FILTERS)
     assert client.post("/api/ranked/queue", json=FILTERS).status_code == 409
+
+
+def test_redis_match_uses_shared_future_start(client, monkeypatch):
+    monkeypatch.setattr(ranked_routes, 'RANKED_WARMUP_SECONDS', 7)
+    alice = register(client, 'alice'); as_(client, alice)
+    client.post('/api/ranked/queue', json=FILTERS)
+    bob = register(client, 'bob'); as_(client, bob)
+    mid = client.post('/api/ranked/queue', json=FILTERS).json()['match_id']
+    first = client.get(f'/api/ranked/matches/{mid}').json()
+    as_(client, alice)
+    second = client.get(f'/api/ranked/matches/{mid}').json()
+    assert first['started_at'] == second['started_at'] > second['server_now']
+    assert first['deadline'] - first['started_at'] == FILTERS['duration_minutes'] * 60
+    assert second['intro']['starts_at'] is None
+    as_(client, alice).post(f'/api/ranked/matches/{mid}/ready')
+    as_(client, bob)
+    scheduled = client.post(f'/api/ranked/matches/{mid}/ready').json()
+    assert scheduled['intro']['ready_count'] == 2
+    assert scheduled['intro']['starts_at'] == scheduled['started_at'] > scheduled['server_now']
 
 
 def test_leave_over_redis_backend(client):
