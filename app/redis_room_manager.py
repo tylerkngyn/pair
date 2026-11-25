@@ -21,6 +21,8 @@ from fastapi import WebSocket, WebSocketDisconnect
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
+from app.observability import METRICS, log_event
+
 logger = logging.getLogger(__name__)
 
 # Backoff before retrying the pub/sub listener or a reap sweep after a Redis
@@ -113,7 +115,10 @@ class RedisRoomManager:
 
     async def connect(self, socket: WebSocket) -> Peer:
         await socket.accept()
-        return Peer(socket=socket)
+        peer = Peer(socket=socket)
+        METRICS.ws_connections_active.inc()
+        log_event("ws_connect", peer_id=peer.id)
+        return peer
 
     async def _send_raw(self, peer: Peer, event: dict) -> bool:
         try:
@@ -268,6 +273,8 @@ class RedisRoomManager:
         drops bookkeeping and Redis membership — it never re-closes the
         socket itself, unlike _remove_peer used by reap/eviction below.
         """
+        METRICS.ws_connections_active.dec()
+        log_event("ws_disconnect", peer_id=peer.id, room=peer.room)
         if peer.user_id is not None and self._local_users.get(peer.user_id) is peer:
             del self._local_users[peer.user_id]
         code = peer.room
@@ -342,6 +349,8 @@ class RedisRoomManager:
             try:
                 await self._reap_once()
             except RedisError:
+                METRICS.redis_reconnects_total.inc()
+                log_event("redis_reconnect", source="reap_loop")
                 logger.warning("Reap sweep failed; Redis unreachable, will retry next interval", exc_info=True)
 
     async def _reap_once(self) -> None:
@@ -382,6 +391,8 @@ class RedisRoomManager:
                     async for message in pubsub.listen():
                         await self._handle_message(message)
             except RedisError:
+                METRICS.redis_reconnects_total.inc()
+                log_event("redis_reconnect", source="listener")
                 logger.warning(
                     "Pub/sub listener lost its Redis connection; reconnecting in %ss",
                     RECONNECT_BACKOFF_SECONDS, exc_info=True,
@@ -400,6 +411,7 @@ class RedisRoomManager:
             peer = self._local_users.get(channel.removeprefix(USER_CHANNEL_PREFIX))
             if peer is not None and await self._send_raw(peer, event["event"]):
                 await self._redis.set(f"{ACK_KEY_PREFIX}{event['nonce']}", 1, ex=ACK_TTL_SECONDS)
+                METRICS.messages_fanned_out_total.inc()
             return
         code = channel.removeprefix(CHANNEL_PREFIX)
         if event.get("type") == "_evict":
@@ -408,10 +420,14 @@ class RedisRoomManager:
         peers = self._local_peers.get(code)
         if not peers:
             return
+        start = time.perf_counter()
+        log_event("message_fanout", room=code, event_type=event.get("type"), recipients=len(peers))
         failed = []
         for p in list(peers):
             if not await self._send_raw(p, event):
                 failed.append(p)
+        METRICS.messages_fanned_out_total.inc(len(peers) - len(failed))
+        METRICS.fanout_latency_seconds.observe(time.perf_counter() - start)
         for p in failed:
             await self.disconnect(p)
             await self.close(p, 1011)

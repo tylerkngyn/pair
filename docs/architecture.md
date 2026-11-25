@@ -314,6 +314,28 @@ Solid arrows into Redis are only active once `REDIS_URL` is set; the dashed in-p
 - **Per-match Redis finalization lock**, `RedisRankedQueue.acquire_finalize_lock(match_id, worker_id)` — `SET match_lock:<id> <worker_id> NX EX 10`. `_finalize_if_ready` takes it before doing any of the expensive per-problem work, and the DB-side guard was rewritten to match the checklist's literal wording: an atomic `UPDATE ranked_matches SET status='completed' ... WHERE status='active'` *claimed before* computing Elo or touching any `Rating` row, not an ORM attribute set applied after the fact. That ordering matters — claiming first means a losing racer (lock contention, or the lock expiring mid-flight) bails out with nothing mutated yet, rather than needing to discard already-staged changes.
 - **Real two-worker load test for the double-finalize race**, `tests/test_ranked_multiprocess_integration.py` — two actual `uvicorn` subprocesses sharing one real Redis (Docker or `PAIR_TEST_REDIS_URL`, same infra `test_multiprocess_integration.py` already used for the room manager) and one shared SQLite file, matched across processes, both independently racing to finalize the same match the instant its deadline passes. Confirmed to catch a real regression two different ways: disabling the lock *and* the DB guard together (but not either alone — on SQLite, either one turns out to be independently sufficient, since SQLite's own write-serialization already collapses the narrow race window the lock exists for) makes the test fail with `matches_played == 2`, i.e. the Elo update actually landing twice.
 
+## Observability
+
+Two pieces, both in `app/observability.py`, wired into both room managers and `ranked_routes.py`:
+
+**Structured event logging.** `log_event(event, **fields)` logs one JSON line per call to the `pair.events` logger — no new logging dependency, just `logging` + `json.dumps`. Events currently emitted: `ws_connect`/`ws_disconnect` (`peer_id`, `room`), `message_fanout` (`room`, `event_type`, `recipients`, emitted once per fan-out call, not once per recipient — keeps volume proportional to events, not to room size), `ranked_queue_join` (`user_id`, `backend`, `status`, `match_id` when matched, `via="poll"` when a widen-on-poll found it rather than a fresh join), `ranked_finalize` (`match_id`, and one of `lock="acquired"`/`lock="skipped"`, `db_guard="lost_race"`, or `result="completed"` with both outcomes), and `redis_reconnect` (`source="listener"` or `"reap_loop"`). Every event carries whatever ID makes it traceable — `match_id` for ranked events, `peer_id`/`user_id` for connection events — not a single global "request ID," since a WebSocket connection and a ranked match both outlive any one HTTP request.
+
+**`GET /metrics`, Prometheus text exposition format.** Hand-rolled (`_Counter`/`_Gauge`/`_Histogram` classes in `app/observability.py`, ~90 lines total) rather than pulling in `prometheus_client` — this app's metric surface is small enough that the dependency wasn't worth adding. Exposed:
+
+| Metric | Type | What it counts |
+| --- | --- | --- |
+| `pair_ws_connections_active` | gauge | WebSocket connections this worker currently holds locally |
+| `pair_messages_fanned_out_total` | counter | Room/user events actually delivered to a locally-held peer |
+| `pair_fanout_latency_seconds` | histogram | Wall time to fan one event out to its local recipient(s) |
+| `pair_ranked_queue_depth` | gauge | Accounts waiting in the queue — **in-process backend only**, see below |
+| `pair_matches_finalized_total` | counter | Ranked matches that completed Elo finalization |
+| `pair_finalize_race_prevented_total` | counter | Finalize attempts correctly turned away — the Redis lock or the DB `status='active'` guard catching a losing racer |
+| `pair_redis_reconnects_total` | counter | Times the pub/sub listener or reap loop recovered from a dropped Redis connection |
+
+**Per-process, not cluster-wide** — same split as the rest of this app's design (only Redis room/queue membership is actually shared state; everything else, including these counters, is local to whichever worker answers the scrape). A real multi-instance deployment would need either a `/metrics` aggregator in front or Redis-backed counters; neither is built, since there's currently no multi-instance deployment to aggregate for (see the Obsidian plan's "decide whether Render's free single-instance plan is kept" line — still an open human decision).
+
+**`pair_ranked_queue_depth` does not track the Redis-backed queue's depth.** Computing it would need an extra async Redis round trip (summing `ZCARD` across every `rq:<filters_hash>` key) on every `/metrics` scrape; left out to keep the endpoint a cheap, synchronous read. If this gauge reads `0` under a `REDIS_URL` deployment, that's this limitation, not an empty queue.
+
 ## Verification and remaining work
 
 The automated suite passes 197 tests covering the 150 reference implementations and starter failures, alternative outputs/deep-copy checks, account hashing/cookies/revocation/CSRF/limits, ownership isolation, stale revisions, score invalidation, configuration, deadlines/overtime, restart persistence, execution boundaries, bundled asset delivery, and retained chat lifecycle. With all external HTTP requests blocked, the real-browser workflow passes account creation/login/history, Run/Submit, runtime reuse, themes, mobile layout, opaque-origin isolation, Stop, and automatic execution timeout. Injected missing-asset and stalled-download checks also pass: controls recover, Stop cancels loading, and retry succeeds. The extended browser run passes every reference across all 150 problems and 460 fixtures using the app's real bundled files, without a test-only CDN replacement.

@@ -37,6 +37,7 @@ from app.models import (
     MatchResultEvent, MatchResultPayload,
     OpponentProgressEvent, OpponentProgressPayload,
 )
+from app.observability import METRICS, log_event
 from app.practice import auth
 from app.practice.auth import token_hash
 from app.practice.catalog import PROBLEMS
@@ -228,8 +229,12 @@ async def _join_in_process(request: Request, user, filters: QueueFilters):
             opponent_entry = _find_opponent(incoming)
             if opponent_entry is None:
                 _QUEUE.append(incoming)
+                METRICS.ranked_queue_depth.set(len(_QUEUE))
+                log_event("ranked_queue_join", user_id=user.id, backend="in_process", status="queued")
                 return {"status": "queued", "queued_at": incoming["queued_at"]}
             match_info = await _match_and_push(request, opponent_entry, incoming, db)
+            METRICS.ranked_queue_depth.set(len(_QUEUE))
+    log_event("ranked_queue_join", user_id=user.id, backend="in_process", status="matched", match_id=match_info["match_id"])
     await _push_match_found(request, match_info, incoming, opponent_entry)
     return {"status": "matched", "match_id": match_info["match_id"]}
 
@@ -247,9 +252,11 @@ async def _join_redis(request: Request, redis_queue, user, filters: QueueFilters
         if result["status"] == "already_queued":
             raise HTTPException(409, "Already queued")
         if result["status"] == "queued":
+            log_event("ranked_queue_join", user_id=user.id, backend="redis", status="queued")
             return {"status": "queued", "queued_at": result["queued_at"]}
         opponent = result["opponent"]
         match_info = _match_info(_create_match(db, opponent, incoming))
+    log_event("ranked_queue_join", user_id=user.id, backend="redis", status="matched", match_id=match_info["match_id"])
     await redis_queue.mark_pending(opponent["user_id"], match_info["match_id"])
     await redis_queue.mark_pending(user.id, match_info["match_id"])
     await _push_match_found(request, match_info, incoming, opponent, redis_queue)
@@ -273,6 +280,7 @@ async def leave_queue(request: Request, identity=Depends(auth.authenticated_writ
                 raise HTTPException(409, "Already matched")
         before = len(_QUEUE)
         _QUEUE[:] = [e for e in _QUEUE if e["user_id"] != user_id]
+        METRICS.ranked_queue_depth.set(len(_QUEUE))
         if len(_QUEUE) == before:
             raise HTTPException(404, "Not in queue")
         return {"status": "left"}
@@ -309,6 +317,7 @@ async def _poll_in_process(request: Request, user_id: str):
             return {"status": "queued"}
         with request.app.state.database.session.begin() as db:
             match_info = await _match_and_push(request, opponent_entry, mine, db)
+    log_event("ranked_queue_join", user_id=user_id, backend="in_process", status="matched", match_id=match_info["match_id"], via="poll")
     await _push_match_found(request, match_info, mine, opponent_entry)
     return {"status": "matched", "match_id": match_info["match_id"]}
 
@@ -325,6 +334,7 @@ async def _poll_redis(request: Request, redis_queue, user_id: str):
     opponent, mine = result["opponent"], result["mine"]
     with request.app.state.database.session.begin() as db:
         match_info = _match_info(_create_match(db, opponent, mine))
+    log_event("ranked_queue_join", user_id=user_id, backend="redis", status="matched", match_id=match_info["match_id"], via="poll")
     await redis_queue.mark_pending(opponent["user_id"], match_info["match_id"])
     await redis_queue.mark_pending(user_id, match_info["match_id"])
     await _push_match_found(request, match_info, mine, opponent, redis_queue)
@@ -373,8 +383,12 @@ async def _finalize_if_ready(db, match: RankedMatch, redis_queue=None):
     # passing finalizes a match.)
     if time.time() <= match.deadline:
         return None
-    if redis_queue is not None and not await redis_queue.acquire_finalize_lock(match.id, _WORKER_ID):
-        return None
+    if redis_queue is not None:
+        if not await redis_queue.acquire_finalize_lock(match.id, _WORKER_ID):
+            METRICS.finalize_race_prevented_total.inc()
+            log_event("ranked_finalize", match_id=match.id, lock="skipped", worker_id=_WORKER_ID)
+            return None
+        log_event("ranked_finalize", match_id=match.id, lock="acquired", worker_id=_WORKER_ID)
     # The actual DB-side transition guard: an atomic conditional UPDATE,
     # not an ORM attribute set applied later. Claiming the transition
     # BEFORE computing or writing any Elo/Rating changes means a losing
@@ -389,6 +403,8 @@ async def _finalize_if_ready(db, match: RankedMatch, redis_queue=None):
         .values(status="completed", finished_at=now)
     )
     if claimed.rowcount != 1:
+        METRICS.finalize_race_prevented_total.inc()
+        log_event("ranked_finalize", match_id=match.id, db_guard="lost_race")
         return None
     match.status, match.finished_at = "completed", now
     participants = list(db.scalars(select(RankedParticipant).where(RankedParticipant.match_id == match.id)))
@@ -441,6 +457,8 @@ async def _finalize_if_ready(db, match: RankedMatch, redis_queue=None):
             "opponent_rating_after": opponent_new_rating,
         }
     db.flush()
+    METRICS.matches_finalized_total.inc()
+    log_event("ranked_finalize", match_id=match.id, result="completed", outcome_a=outcome_a, outcome_b=outcome_b)
     return results
 
 

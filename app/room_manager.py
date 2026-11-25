@@ -16,6 +16,7 @@ from app.models import (
     ReactionPayload, RoomStateEvent, RoomStatePayload, ServerEvent,
     SystemEvent, SystemPayload, TypingBroadcast, TypingPayload,
 )
+from app.observability import METRICS, log_event
 
 
 @dataclass(eq=False)
@@ -44,7 +45,10 @@ class RoomManager:
 
     async def connect(self, socket: WebSocket) -> Peer:
         await socket.accept()
-        return Peer(socket=socket)
+        peer = Peer(socket=socket)
+        METRICS.ws_connections_active.inc()
+        log_event("ws_connect", peer_id=id(peer))
+        return peer
 
     async def heartbeat(self, peer: Peer) -> None:
         """No-op here; only RedisRoomManager needs a liveness signal to reap."""
@@ -154,6 +158,8 @@ class RoomManager:
             )))
 
     async def disconnect(self, peer: Peer) -> None:
+        METRICS.ws_connections_active.dec()
+        log_event("ws_disconnect", peer_id=id(peer), room=peer.room)
         if peer.user_id is not None and self._users.get(peer.user_id) is peer:
             del self._users[peer.user_id]
         code = peer.room
@@ -175,6 +181,16 @@ class RoomManager:
         Failures during either event delivery or state delivery produce departure
         notices for survivors. Iterate rather than recursively acquiring a lock.
         """
+        start = time.perf_counter()
+        recipient_count = len(room.peers)
+        log_event("message_fanout", room=room.code, event_type=event.type, recipients=recipient_count)
+        try:
+            await self._publish_inner(room, event)
+        finally:
+            METRICS.messages_fanned_out_total.inc(recipient_count)
+            METRICS.fanout_latency_seconds.observe(time.perf_counter() - start)
+
+    async def _publish_inner(self, room: Room, event: ServerEvent) -> None:
         events: list[ServerEvent] = [event]
         refresh_state = not isinstance(event, (ChatBroadcast, TypingBroadcast, ReactionBroadcast))
         while room.peers:

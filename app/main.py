@@ -6,12 +6,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from anyio import CancelScope
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
 from app.models import ChatEvent, JoinEvent, PingEvent, ReactionEvent, TypingEvent, client_event_adapter
+from app.observability import METRICS
 from app.room_manager import RoomManager
 from app.practice import auth
 from app.practice.database import Database
@@ -100,6 +101,16 @@ async def ranked_test_page():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus text exposition format (see app/observability.py for why
+    this is hand-rolled instead of prometheus_client). Per-process, like
+    the rest of this app's shared-vs-local state split — see
+    docs/architecture.md's Observability section.
+    """
+    return Response(METRICS.render(), media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
 @app.websocket("/ws")
