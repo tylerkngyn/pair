@@ -16,6 +16,7 @@ from app.models import (
     ReactionPayload, RoomStateEvent, RoomStatePayload, ServerEvent,
     SystemEvent, SystemPayload, TypingBroadcast, TypingPayload,
 )
+from app.observability import METRICS, log_event
 
 
 @dataclass(eq=False)
@@ -23,7 +24,9 @@ class Peer:
     socket: WebSocket
     handle: str = ""
     room: str | None = None
+    user_id: str | None = None
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    disconnected: bool = False
 
 
 @dataclass
@@ -39,10 +42,32 @@ class RoomManager:
 
     def __init__(self) -> None:
         self._rooms: dict[str, Room] = {}
+        self._users: dict[str, Peer] = {}
 
     async def connect(self, socket: WebSocket) -> Peer:
         await socket.accept()
-        return Peer(socket=socket)
+        peer = Peer(socket=socket)
+        METRICS.ws_connections_active.inc()
+        log_event("ws_connect", peer_id=id(peer))
+        return peer
+
+    async def heartbeat(self, peer: Peer) -> None:
+        """No-op here; only RedisRoomManager needs a liveness signal to reap."""
+
+    async def identify(self, peer: Peer, user_id: str) -> None:
+        """Associate a peer with an account so it can be reached by user_id
+        alone, before (or without) ever joining a room — e.g. a queued
+        ranked player waiting for MATCH_FOUND. A newer connection for the
+        same account replaces the older one as the delivery target.
+        """
+        peer.user_id = user_id
+        self._users[user_id] = peer
+
+    async def send_to_user(self, user_id: str, event: ServerEvent) -> bool:
+        peer = self._users.get(user_id)
+        if peer is None:
+            return False
+        return await self.send(peer, event)
 
     async def send(self, peer: Peer, event: ServerEvent) -> bool:
         """Serialize sends per socket; a slow/broken peer cannot stall forever."""
@@ -134,6 +159,17 @@ class RoomManager:
             )))
 
     async def disconnect(self, peer: Peer) -> None:
+        """Idempotent per peer: see RedisRoomManager.disconnect's docstring
+        for the double-call path this guards against, for this manager's
+        own protection against ever being called twice for one peer.
+        """
+        if peer.disconnected:
+            return
+        peer.disconnected = True
+        METRICS.ws_connections_active.dec()
+        log_event("ws_disconnect", peer_id=id(peer), room=peer.room)
+        if peer.user_id is not None and self._users.get(peer.user_id) is peer:
+            del self._users[peer.user_id]
         code = peer.room
         room = self._rooms.get(code) if code is not None else None
         if room is None:
@@ -153,6 +189,16 @@ class RoomManager:
         Failures during either event delivery or state delivery produce departure
         notices for survivors. Iterate rather than recursively acquiring a lock.
         """
+        start = time.perf_counter()
+        recipient_count = len(room.peers)
+        log_event("message_fanout", room=room.code, event_type=event.type, recipients=recipient_count)
+        try:
+            await self._publish_inner(room, event)
+        finally:
+            METRICS.messages_fanned_out_total.inc(recipient_count)
+            METRICS.fanout_latency_seconds.observe(time.perf_counter() - start)
+
+    async def _publish_inner(self, room: Room, event: ServerEvent) -> None:
         events: list[ServerEvent] = [event]
         refresh_state = not isinstance(event, (ChatBroadcast, TypingBroadcast, ReactionBroadcast))
         while room.peers:

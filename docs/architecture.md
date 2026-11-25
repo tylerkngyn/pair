@@ -27,7 +27,7 @@ flowchart TB
     P --> T[Correctness + invocation timing]
     T -->|Browser-reported result| U
     U -->|Save submission and code revision| S
-    U -. future multiplayer .-> WS[Retained WebSocket room layer]
+    U -. ranked mode: see the distributed-matchmaking diagram below .-> WS[WebSocket room/match layer]
 ```
 
 FastAPI handles accounts, ownership, problem selection, session deadlines, draft versions, and result persistence. It does not execute submitted code. Execution is confined to the user's browser. This avoids operating a paid execution service and keeps CPU-bound user code out of the web-server process.
@@ -149,6 +149,192 @@ Before parallel feature work, agree on Pydantic request/response schemas in `rou
 Keep practice rules and execution independent of room storage. A later paired interview room should reference a persisted practice-session ID and explicit participant roles, not infer a leader from an unordered Redis hash. PostgreSQL remains the durable source for accounts, drafts, and reports. Redis can hold live membership/presence and deliver room events to each worker's local sockets.
 
 Integrate the existing GitHub Redis implementation deliberately before scaling chat workers. Redis Pub/Sub is live delivery without durable replay; do not use it as the only store for submissions or grades. Shared editing needs a conflict strategy beyond whole-draft last-writer updates. A trusted multiplayer assessment also needs a separate server-side execution service; current browser scores remain self-reported.
+
+## Ranked mode contract (Phase 1 implemented; WS still draft)
+
+The HTTP surface below is implemented on `ranked-mode` (`app/practice/ranked_routes.py`), reusing the existing account/CSRF/ownership patterns from `app/practice/routes.py`. Junze owns edits to this section; changes here should land before dependent frontend code, not after. No Render/production deployment of this is claimed — same disclaimer as the rest of this document.
+
+### HTTP
+
+`POST /api/ranked/queue` — request:
+
+```json
+{"categories": ["arrays", "graphs"], "difficulty": "mixed", "duration_minutes": 30, "problem_count": 2}
+```
+
+Same field constraints as the existing solo `Settings` model (`duration_minutes` 5–180, `problem_count` 1–5, `categories` max 20). No `allow_overtime` or `problem_ids` field — ranked matches are always strict-deadline and always randomized. Response, `202`, one of:
+
+```json
+{"status": "queued", "queued_at": 1764012345.0}
+{"status": "matched", "match_id": "a1b2c3"}
+```
+
+Deviation from the original draft: a synchronous match returns only `match_id`, not the full opponent/deadline/problems payload — the client fetches those from `GET /api/ranked/matches/{id}` (added below) so there is one source of truth for match detail instead of two.
+
+`DELETE /api/ranked/queue` — no body. `200` `{"status": "left"}`, `404` if not queued, or `409` `{"detail": "Already matched"}` if a match was found before the cancel was processed.
+
+`GET /api/ranked/queue` — **new, not in the original draft.** Started as a fallback for when WebSocket delivery can't be confirmed (see "WebSocket" below) — consumes the pending-match notice on read. It now also does real work beyond that: if the polling account is still queued, it opportunistically retries matching against the whole queue with its own wait-widened window (`app/practice/ranked_routes.py`'s `_find_opponent`, same widening math `POST /api/ranked/queue` uses). This matters because matching otherwise only ever runs inside *another* account's `POST` — a lone queued player's own window would never widen just from waiting, since nothing re-checks it. The client already polls this endpoint regularly for the MATCH_FOUND fallback, so this piggybacks on that instead of needing a separate background task.
+
+```json
+{"status": "idle"}
+{"status": "queued"}
+{"status": "matched", "match_id": "a1b2c3"}
+```
+
+`GET /api/ranked/rating` — `200`:
+
+```json
+{"rating": 1000, "matches_played": 0, "tier": "Gold"}
+```
+
+`tier` is computed server-side from `rating` at response time (400-point bands, floor `100`) so the client never re-implements the tier boundaries; it is never stored. Band edges: Bronze `100–499`, Silver `500–899`, Gold `900–1299`, Diamond `1300+`.
+
+`outcome` (both here and in the match/history/WS payloads below) is one of `win`/`loss`/`draw`/`abandoned` — `abandoned` marks a loss caused specifically by never submitting anything in the match, so it's distinguishable from a `loss` earned by trying and losing on correctness or time. If one side never submits, it's `abandoned` and the other side `win`s regardless of the other's correctness (showing up and failing beats not showing up). If *neither* side ever submits, both get `abandoned` — not a draw, since a draw would cost an abandoning account nothing and the Obsidian plan requires abandonment to cost rating. There's no winner to run through the normal zero-sum Elo update in that case, so each side is scored independently as a loss against an opponent of its own rating (same shape as a chess resignation, −K/2 each).
+
+`GET /api/ranked/matches/{match_id}` — **new.** Match detail for either participant; also the only place finalization is checked (see below). `404` for a match the caller isn't a participant in.
+
+```json
+{
+  "id": "a1b2c3", "status": "completed", "deadline": 1764013800.0, "finished_at": 1764013801.2,
+  "problems": [{"id": "two-sum", "title": "Two Sum", "category": "arrays", "difficulty": "easy"}],
+  "my_outcome": "win", "my_rating_after": 1016,
+  "opponent_outcome": "loss", "opponent_rating_after": 984
+}
+```
+
+`PUT /api/ranked/matches/{match_id}/work/{problem_id}` — **new.** Same shape as the solo `SaveWork` body (`code`, `revision`, optional `report`); same revision-precondition 409 on a stale save. Rejects a reported pass with `422` if the elapsed time since `match.started_at` is below `SUBMISSION_PLAUSIBILITY_FLOOR_SECONDS` (10s) — the anti-cheat floor from the Obsidian plan — and applies a ranked-specific submission rate limit (20/minute per account) separate from `auth.throttle`'s login-attempt limits.
+
+`GET /api/ranked/history` — `200`, same pagination shape (latest 30) as `GET /api/practice`:
+
+```json
+{
+  "matches": [
+    {
+      "id": "a1b2c3", "opponent": "someuser", "started_at": 1764012000.0, "finished_at": 1764013800.0,
+      "outcome": "win", "rating_before": 1000, "rating_after": 1016
+    }
+  ]
+}
+```
+
+Deviation from the original draft: no nested `problems` array — the caller already has that from `GET /api/ranked/matches/{id}` and duplicating it here would need another join per row for no new information.
+
+### WebSocket — implemented
+
+Was the one deliberately deferred piece of Phase 1; now built. The gap was real, not a formality: `RoomManager`/`RedisRoomManager` deliver by **room code** with anonymous handles, and there was no way to reach "this account's socket" before it had joined a room — exactly what a queued ranked player needs. Fixed by adding per-account identity and delivery alongside the existing room mechanism, not replacing it:
+
+- `Peer` (both `app/room_manager.py` and `app/redis_room_manager.py`) gained a `user_id` field, set by a new `identify(peer, user_id)` call.
+- `app/main.py`'s `/ws` endpoint identifies a connecting socket automatically from its `pair_session` cookie via `auth.user_for_token` (best-effort — a missing/expired cookie just leaves the peer anonymous, same as plain chat today). This happens once, right after `connect()`, before the client sends anything.
+- Both managers gained `send_to_user(user_id, event) -> bool`, and both now report **real** delivery success. `RoomManager`'s is a local dict lookup. `RedisRoomManager`'s publishes an envelope `{nonce, event}` to a `user:<id>` Pub/Sub channel (parallel to the existing `chan:<room>` ones, same listener task, same `psubscribe`); whichever worker's `_listen` successfully delivers it locally sets `ack:<nonce>` in Redis, and `send_to_user` polls for that key (every 20ms, up to `PAIR_ACK_WAIT_SECONDS`, default 0.5s) before returning. No ack within that window — no subscriber anywhere, or a target worker whose local send failed — correctly returns `False`, same as a publish into the void should.
+- `PingEvent` now works with no room joined (previously it was swallowed by "Send a join event first"), since a queued player has no room yet but still needs to survive the idle timeout.
+
+`MATCH_FOUND` (server → both clients, pushed from `POST /api/ranked/queue` the moment a match is created):
+
+```json
+{"type": "match_found", "payload": {"match_id": "a1b2c3", "opponent": "someuser", "opponent_rating": 1042, "deadline": 1764013800.0, "problems": [{"id": "two-sum", "title": "Two Sum"}]}}
+```
+
+`GET /api/ranked/queue` polling remains as a fallback for whenever delivery can't be confirmed (an unidentified socket, no socket open at all, or — see above — any push at all under `RedisRoomManager`, since it can't confirm delivery). `_PENDING_MATCH` is popped as soon as a push reports `True`, and separately, the queue's own "already matched" guard is a DB query (`_has_active_match`), not `_PENDING_MATCH` — the dict is purely a notification mailbox now; it must never also gate re-queueing, since it's expected to get cleared out from under an active match.
+
+`OPPONENT_PROGRESS` (server → the opponent only, pushed from `PUT /api/ranked/matches/{id}/work/{problem_id}` on every submission with a report):
+
+```json
+{"type": "opponent_progress", "payload": {"problem_statuses": {"two-sum": "passed", "lru-cache": "attempted"}, "correctness": 62.5}}
+```
+
+Never contains code, stdout, or per-case detail — see the trust-boundary note in the Obsidian plan on why this stays coarse.
+
+`MATCH_RESULT` (server → both clients, pushed exactly once, from whichever `GET /api/ranked/matches/{id}` call's `_finalize_if_ready` actually flips the match to `completed`):
+
+```json
+{"type": "match_result", "payload": {"outcome": "win", "my_correctness": 100.0, "opponent_correctness": 62.5, "rating_before": 1000, "rating_after": 1016, "opponent_rating_after": 1026}}
+```
+
+Covered by `tests/test_redis_room_manager.py` (cross-worker `send_to_user`, unknown-account no-op, disconnect clearing identity), `tests/test_chat.py` (ping before join), and `tests/practice/test_ranked_routes.py` (end-to-end over real `/ws` connections: `MATCH_FOUND` to both sides, `OPPONENT_PROGRESS` to the opponent on submit, `MATCH_RESULT` to both on finalize).
+
+### Data model
+
+Implemented in `app/practice/database.py`: `Rating`, `RankedMatch`, `RankedParticipant`, `RankedWork`. One deviation from the Obsidian plan's drafted shape: `RankedWork`'s primary key is `(match_id, problem_id, user_id)`, not `(match_id, problem_id)` — the plan's table omitted `user_id`, but both participants solve the same `problem_id` in the same `match_id`, so without it one side's submission would overwrite the other's row.
+
+### Finalization
+
+Lazy, not event-driven: `GET /api/ranked/matches/{id}` checks `status == "active" and time.time() > deadline` on every read and runs the Elo update + both `Rating` writes in the same transaction if so, then flips `status` to `"completed"`. The status-guard read-then-write is single-process-safe for Phase 1; the Obsidian plan's Phase 2 section covers the additional Redis finalization lock still needed once two workers can race this — not yet built; see "Phase 2: distributed matchmaking" below for what has.
+
+### Phase 2: distributed matchmaking — implemented
+
+```mermaid
+flowchart TB
+    BA[Player A browser] -->|HTTPS: POST/GET/DELETE /api/ranked/queue| R1
+    BB[Player B browser] -->|HTTPS: same, lands on a different worker| R2
+    BA <-.->|WS: match_found, opponent_progress, match_result| RM1
+    BB <-.->|WS: same events| RM2
+
+    subgraph Worker1[Worker 1]
+        R1[ranked_routes.py]
+        RM1[RoomManager or RedisRoomManager]
+    end
+    subgraph Worker2[Worker 2]
+        R2[ranked_routes.py]
+        RM2[RoomManager or RedisRoomManager]
+    end
+
+    R1 -.->|REDIS_URL unset: default| Q1[(in-process queue, this worker only)]
+    R2 -.->|REDIS_URL unset: default| Q2[(in-process queue, this worker only)]
+    R1 -->|REDIS_URL set| RQ[RedisRankedQueue: join and poll Lua scripts]
+    R2 -->|REDIS_URL set| RQ
+    RQ --> REDIS[(Redis: ranked queue ZSET, meta hash, pending mailbox)]
+
+    RM1 -->|REDIS_URL set: user and room channels, plus ack keys| REDIS
+    RM2 -->|REDIS_URL set: same channels, cross-worker delivery| REDIS
+
+    R1 --> DB[(RankedMatch, RankedParticipant, RankedWork, Rating)]
+    R2 --> DB
+```
+
+Solid arrows into Redis are only active once `REDIS_URL` is set; the dashed in-process-queue arrows are what each worker falls back to otherwise. The exact same deploy, with no code change, degrades to two independent single-worker islands without `REDIS_URL` set — each worker's in-process queue and `RoomManager` only ever sees its own requests and sockets. `ranked_routes.py` and `app/main.py`'s lifespan are what decide which path is live, per the "Wiring" note below; the database is the one thing both workers always share regardless, since it was never in-process to begin with.
+
+`app/practice/redis_ranked_queue.py`'s `RedisRankedQueue` replaces the Phase 1 in-process `_QUEUE`/`_PENDING_MATCH` globals once more than one worker needs to see the same waiting players — the same problem `app/redis_room_manager.py` already solves for chat/ranked rooms, applied to matchmaking instead of room membership.
+
+**Data model**, one ZSET + one meta hash per distinct filter combination (matching only ever considers identical filters, same as Phase 1):
+- `rq:<filters_hash>` — ZSET, member = `user_id`, score = `rating`.
+- `rq_meta:<user_id>` — HASH: `username`, `rating`, `filters` (json), `queued_at`, `filters_hash`. Presence alone means "this account is queued" — there's no separate index.
+- `rq_pending:<user_id>` — a short-lived (`PENDING_TTL_SECONDS`, default 300s) `MATCH_FOUND` mailbox, the Redis analog of the in-process `_PENDING_MATCH` dict. Needed because the side that was already waiting when someone else's request matches it has no other way to learn the match_id if the WebSocket push doesn't confirm delivery.
+
+**Matching runs in two Lua scripts**, for the same reason `app/redis_room_manager.py`'s `_JOIN_SCRIPT` does — two workers racing the same pair of requests must not both claim the same match:
+- The join script: checks the account isn't already queued, scans the filter group's ZSET for a candidate within the rating window (widened by *the candidate's own wait*, so a fresh arrival can immediately match a long-waiting candidate), and either returns that match (removing the candidate) or adds itself to the queue.
+- The poll script: the Redis equivalent of `GET /api/ranked/queue`'s opportunistic widen-and-retry. Widens based on **whichever side has waited longer** (`min()` of both `queued_at` values) rather than just the candidate's wait, since the polling account's own long wait should count too.
+
+**Wiring**: `app/main.py`'s lifespan sets `app.state.ranked_queue = RedisRankedQueue(redis_url)` alongside `app.state.rooms` behind the same `REDIS_URL` switch. `ranked_routes.py`'s three queue endpoints branch on `getattr(request.app.state, "ranked_queue", None)` — `None` (the default) keeps the exact Phase 1 in-process behavior; set, it routes through the Redis path instead. Match creation and finalization (`_create_match`, `_finalize_if_ready`) are unchanged either way — they only ever see plain dicts, never which backend produced them.
+
+**A real bug found and fixed while building this**: the in-process `_find_opponent`'s window-widening used `max(candidate_queued_at, incoming_queued_at)` — the *more recent* of the two timestamps, which gives the smaller elapsed time and the narrowest possible window. That's backwards from the stated intent ("a fresh arrival can still immediately match a long-waiting candidate"); it should be `min()`, using whichever side waited longer. Existing tests didn't catch it because both compared timestamps happened to be backdated by the same amount. Fixed with a regression test asserting the asymmetric case (one side old, one side fresh) explicitly, and replicated correctly (`min()`) in the Redis poll script above.
+
+**All remaining Phase 2 checklist items are now built:**
+
+- **Stale-queue-entry sweep.** `RedisRankedQueue.start()`/`stop()`/`_sweep_once()`, same shape as the room manager's reap loop, on a `PAIR_QUEUE_SWEEP_INTERVAL_SECONDS` interval (default 30s). Why a sweep is needed at all despite every key already carrying a TTL: Redis expires a whole key, never one member of a ZSET — if a queued account's `rq_meta:<id>` hash TTLs out without an explicit leave/match, its `user_id` is left stranded in `rq:<filters_hash>` as a ghost member. Both matching Lua scripts already skip a ghost safely (their `#meta > 0` check), but nothing else ever removes it; the sweep does, via a pipelined batch of `EXISTS` checks per filter-group ZSET (same reasoning as the room manager's reap sweep) followed by one `ZREM`.
+- **Per-match Redis finalization lock**, `RedisRankedQueue.acquire_finalize_lock(match_id, worker_id)` — `SET match_lock:<id> <worker_id> NX EX 10`. `_finalize_if_ready` takes it before doing any of the expensive per-problem work, and the DB-side guard was rewritten to match the checklist's literal wording: an atomic `UPDATE ranked_matches SET status='completed' ... WHERE status='active'` *claimed before* computing Elo or touching any `Rating` row, not an ORM attribute set applied after the fact. That ordering matters — claiming first means a losing racer (lock contention, or the lock expiring mid-flight) bails out with nothing mutated yet, rather than needing to discard already-staged changes.
+- **Real two-worker load test for the double-finalize race**, `tests/test_ranked_multiprocess_integration.py` — two actual `uvicorn` subprocesses sharing one real Redis (Docker or `PAIR_TEST_REDIS_URL`, same infra `test_multiprocess_integration.py` already used for the room manager) and one shared SQLite file, matched across processes, both independently racing to finalize the same match the instant its deadline passes. Confirmed to catch a real regression two different ways: disabling the lock *and* the DB guard together (but not either alone — on SQLite, either one turns out to be independently sufficient, since SQLite's own write-serialization already collapses the narrow race window the lock exists for) makes the test fail with `matches_played == 2`, i.e. the Elo update actually landing twice.
+
+## Observability
+
+Two pieces, both in `app/observability.py`, wired into both room managers and `ranked_routes.py`:
+
+**Structured event logging.** `log_event(event, **fields)` logs one JSON line per call to the `pair.events` logger — no new logging dependency, just `logging` + `json.dumps`. Events currently emitted: `ws_connect`/`ws_disconnect` (`peer_id`, `room`), `message_fanout` (`room`, `event_type`, `recipients`, emitted once per fan-out call, not once per recipient — keeps volume proportional to events, not to room size), `ranked_queue_join` (`user_id`, `backend`, `status`, `match_id` when matched, `via="poll"` when a widen-on-poll found it rather than a fresh join), `ranked_finalize` (`match_id`, and one of `lock="acquired"`/`lock="skipped"`, `db_guard="lost_race"`, or `result="completed"` with both outcomes), and `redis_reconnect` (`source="listener"` or `"reap_loop"`). Every event carries whatever ID makes it traceable — `match_id` for ranked events, `peer_id`/`user_id` for connection events — not a single global "request ID," since a WebSocket connection and a ranked match both outlive any one HTTP request.
+
+**`GET /metrics`, Prometheus text exposition format.** Hand-rolled (`_Counter`/`_Gauge`/`_Histogram` classes in `app/observability.py`, ~90 lines total) rather than pulling in `prometheus_client` — this app's metric surface is small enough that the dependency wasn't worth adding. Exposed:
+
+| Metric | Type | What it counts |
+| --- | --- | --- |
+| `pair_ws_connections_active` | gauge | WebSocket connections this worker currently holds locally |
+| `pair_messages_fanned_out_total` | counter | Room/user events actually delivered to a locally-held peer |
+| `pair_fanout_latency_seconds` | histogram | Wall time to fan one event out to its local recipient(s) |
+| `pair_ranked_queue_depth` | gauge | Accounts waiting in the queue — **in-process backend only**, see below |
+| `pair_matches_finalized_total` | counter | Ranked matches that completed Elo finalization |
+| `pair_finalize_race_prevented_total` | counter | Finalize attempts correctly turned away — the Redis lock or the DB `status='active'` guard catching a losing racer |
+| `pair_redis_reconnects_total` | counter | Times the pub/sub listener or reap loop recovered from a dropped Redis connection |
+
+**Per-process, not cluster-wide** — same split as the rest of this app's design (only Redis room/queue membership is actually shared state; everything else, including these counters, is local to whichever worker answers the scrape). A real multi-instance deployment would need either a `/metrics` aggregator in front or Redis-backed counters; neither is built, since there's currently no multi-instance deployment to aggregate for (see the Obsidian plan's "decide whether Render's free single-instance plan is kept" line — still an open human decision).
+
+**`pair_ranked_queue_depth` does not track the Redis-backed queue's depth.** Computing it would need an extra async Redis round trip (summing `ZCARD` across every `rq:<filters_hash>` key) on every `/metrics` scrape; left out to keep the endpoint a cheap, synchronous read. If this gauge reads `0` under a `REDIS_URL` deployment, that's this limitation, not an empty queue.
 
 ## Verification and remaining work
 

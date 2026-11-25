@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#191919">
+<title>Pair — ranked test</title>
+<link rel="stylesheet" href="/assets/styles.css">
+<style>
+  /* Only what the shared stylesheet has no equivalent for; everything else
+     (buttons, inputs, h1/h2, .hint, .narrow, .tabs, etc.) comes from
+     /assets/styles.css so this page matches the real app's look. */
+  .panel { border:1px solid var(--line); border-radius:4px; padding:20px; margin-bottom:24px; }
+  .row { display:flex; gap:16px; flex-wrap:wrap; align-items:flex-end; }
+  .row > label, .row > div { flex:1; min-width:140px; }
+  #code { width:100%; height:320px; padding:14px; background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:4px; font:13px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace; resize:vertical; }
+  #problem-picker button.selected { color:var(--text); border-color:var(--line); background:var(--field); }
+  #log { max-height:320px; overflow-y:auto; border:1px solid var(--line); border-radius:4px; padding:10px 14px; font-size:12px; }
+  #log div { padding:3px 0; border-top:1px solid var(--line); }
+  #log div:first-child { border-top:0; }
+  .ok { color:#8fbf8f; } .err { color:#d08a8a; } .evt { color:#8aa9d0; }
+  #history-out { background:var(--panel); border:1px solid var(--line); border-radius:4px; padding:12px; max-height:260px; overflow:auto; white-space:pre-wrap; word-break:break-all; font-size:12px; }
+</style>
+</head>
+<body>
+  <header><a class="brand" href="/">pair://</a><nav aria-label="Account"><span id="who"></span></nav></header>
+  <main class="narrow wide">
+    <p class="eyebrow">Not part of the product UI</p>
+    <h1>Ranked mode — manual test page</h1>
+    <p class="hint">Open this page in two browser profiles (or one regular + one private window) to play both sides of a match.</p>
+
+    <section class="panel">
+      <h2>Account</h2>
+      <div class="row">
+        <label>Username<input id="username" value="tester"></label>
+        <label>Password<input id="password" type="password" value="good-password-123"></label>
+      </div>
+      <div class="row" style="margin-top:14px">
+        <div><button id="register" class="primary">Register</button></div>
+        <div><button id="login">Log in</button></div>
+        <div><button id="logout">Log out</button></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>WebSocket <small>/ws, auto-identified from your login cookie</small></h2>
+      <div class="row">
+        <div><button id="ws-connect">Connect</button></div>
+        <div><button id="ws-disconnect">Disconnect</button></div>
+        <div>status: <span id="ws-status">disconnected</span></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Queue</h2>
+      <div class="row">
+        <label>Categories (comma-separated, blank = any)<input id="categories"></label>
+        <label>Difficulty
+          <select id="difficulty"><option>mixed</option><option>easy</option><option>medium</option><option>hard</option></select>
+        </label>
+        <label>Duration (min)<input id="duration" type="number" value="30"></label>
+        <label>Problems<input id="count" type="number" value="1"></label>
+      </div>
+      <div class="row" style="margin-top:14px">
+        <div><button id="queue-join" class="primary">Join queue</button></div>
+        <div><button id="queue-leave">Leave queue</button></div>
+        <div><button id="queue-poll">Poll status</button></div>
+        <div><button id="rating-get">My rating</button></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Match <small id="match-id"></small></h2>
+      <p class="hint">1. Click <b>Refresh match</b> to load the problem(s). 2. Click a problem button below to select it — nothing is submittable until one is highlighted. 3. Submit below.</p>
+      <div class="row"><div><button id="match-get">Refresh match</button></div></div>
+      <div id="problem-picker" style="margin:14px 0; display:flex; gap:8px; flex-wrap:wrap;"></div>
+      <label id="selected-label">Code (no problem selected yet)</label>
+      <textarea id="code">def solve():
+    pass</textarea>
+      <div class="row" style="margin-top:14px">
+        <div><button id="submit-pass" class="primary">Submit as all-passing</button></div>
+        <div><button id="submit-fail">Submit as all-failing</button></div>
+        <div><button id="save-draft">Save draft only (no report)</button></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>History</h2>
+      <button id="history-get">Refresh history</button>
+      <pre id="history-out" style="margin-top:14px">—</pre>
+    </section>
+
+    <h2>Event log</h2>
+    <div id="log"></div>
+  </main>
+
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+let csrf = null, username = null, ws = null;
+let currentMatchId = null, currentProblemId = null;
+const revisions = {}; // problem_id -> revision, since each problem in a match tracks its own independently
+
+function log(text, cls) {
+  const line = document.createElement('div');
+  if (cls) line.className = cls;
+  line.textContent = `[${new Date().toLocaleTimeString()}] ${text}`;
+  $('log').prepend(line);
+}
+
+async function api(path, options = {}) {
+  const headers = { ...(options.body ? {'Content-Type': 'application/json'} : {}), ...(csrf ? {'X-CSRF-Token': csrf} : {}), ...options.headers };
+  const sent = options.body ? ` body=${options.body}` : '';
+  const response = await fetch(`/api${path}`, { ...options, headers, credentials: 'same-origin' });
+  let body = null;
+  try { body = await response.json(); } catch {}
+  if (!response.ok) {
+    const detail = typeof body?.detail === 'string' ? body.detail : JSON.stringify(body?.detail ?? body);
+    log(`${options.method || 'GET'} ${path}${sent} -> ${response.status}: ${detail}`, 'err');
+    throw new Error(detail);
+  }
+  log(`${options.method || 'GET'} ${path}${sent} -> ${response.status}: ${JSON.stringify(body)}`, 'ok');
+  return body;
+}
+
+function setIdentity(data) {
+  csrf = data.csrf;
+  username = data.username;
+  $('who').textContent = username ? `signed in: ${username}` : '';
+}
+
+$('register').onclick = () => api('/auth/register', {method: 'POST', body: JSON.stringify({username: $('username').value, password: $('password').value})}).then(setIdentity).catch(() => {});
+$('login').onclick = () => api('/auth/login', {method: 'POST', body: JSON.stringify({username: $('username').value, password: $('password').value})}).then(setIdentity).catch(() => {});
+$('logout').onclick = () => api('/auth/logout', {method: 'POST'}).then(() => setIdentity({csrf: null, username: null})).catch(() => {});
+
+function wsEvent(event) {
+  log(`WS <- ${JSON.stringify(event)}`, 'evt');
+  if (event.type === 'match_found') {
+    currentMatchId = event.payload.match_id;
+    $('match-id').textContent = currentMatchId;
+    refreshMatch();
+  } else if (event.type === 'match_result') {
+    refreshMatch();
+  }
+}
+
+$('ws-connect').onclick = () => {
+  if (ws) return;
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => { $('ws-status').textContent = 'connected'; log('WS connected'); };
+  ws.onclose = () => { $('ws-status').textContent = 'disconnected'; ws = null; log('WS closed'); };
+  ws.onerror = () => log('WS error', 'err');
+  ws.onmessage = e => wsEvent(JSON.parse(e.data));
+  // Keeps the socket alive while queued (no room joined yet).
+  ws._ping = setInterval(() => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({type: 'ping', payload: {}})); }, 10000);
+};
+$('ws-disconnect').onclick = () => { if (ws) { clearInterval(ws._ping); ws.close(); ws = null; } };
+
+$('queue-join').onclick = () => api('/ranked/queue', {method: 'POST', body: JSON.stringify({
+  categories: $('categories').value.split(',').map(s => s.trim()).filter(Boolean),
+  difficulty: $('difficulty').value,
+  duration_minutes: Number($('duration').value),
+  problem_count: Number($('count').value),
+})}).then(data => { if (data.match_id) { currentMatchId = data.match_id; $('match-id').textContent = currentMatchId; refreshMatch(); } }).catch(() => {});
+$('queue-leave').onclick = () => api('/ranked/queue', {method: 'DELETE'}).catch(() => {});
+$('queue-poll').onclick = () => api('/ranked/queue').then(data => { if (data.match_id) { currentMatchId = data.match_id; $('match-id').textContent = currentMatchId; refreshMatch(); } }).catch(() => {});
+$('rating-get').onclick = () => api('/ranked/rating').catch(() => {});
+
+function selectProblem(id) {
+  currentProblemId = id;
+  if (!(id in revisions)) revisions[id] = 0;
+  $('selected-label').textContent = `Code — ${id}`;
+  for (const button of $('problem-picker').children) button.classList.toggle('selected', button.dataset.id === id);
+  log(`Selected problem ${id}`);
+}
+
+function renderProblems(problems) {
+  $('problem-picker').innerHTML = '';
+  problems.forEach(p => {
+    const button = document.createElement('button');
+    button.textContent = p.title;
+    button.dataset.id = p.id;
+    button.style.marginRight = '6px';
+    button.onclick = () => selectProblem(p.id);
+    $('problem-picker').appendChild(button);
+  });
+  // Auto-select the first problem so a fresh "Refresh match" is immediately submittable.
+  if (problems.length && !problems.some(p => p.id === currentProblemId)) selectProblem(problems[0].id);
+  else if (currentProblemId) selectProblem(currentProblemId);
+}
+
+async function refreshMatch() {
+  if (!currentMatchId) return;
+  const data = await api(`/ranked/matches/${currentMatchId}`).catch(() => null);
+  if (data) renderProblems(data.problems);
+}
+$('match-get').onclick = refreshMatch;
+
+async function submitWork(report) {
+  if (!currentMatchId || !currentProblemId) { log('No match/problem selected yet', 'err'); return; }
+  const body = { code: $('code').value, revision: revisions[currentProblemId] || 0, report };
+  const result = await api(`/ranked/matches/${currentMatchId}/work/${currentProblemId}`, {method: 'PUT', body: JSON.stringify(body)}).catch(() => null);
+  if (result) revisions[currentProblemId] = result.revision;
+}
+$('save-draft').onclick = () => submitWork(null);
+$('submit-pass').onclick = async () => {
+  const match = await api(`/ranked/matches/${currentMatchId}`).catch(() => null);
+  if (!match) return;
+  const problem = match.problems.find(p => p.id === currentProblemId);
+  // test_count isn't in match detail; fall back to catalog for the exact case count.
+  const catalog = await api('/catalog').catch(() => null);
+  const total = catalog?.problems.find(p => p.id === currentProblemId)?.test_count || 1;
+  submitWork({ passed: total, total, cases: Array.from({length: total}, () => ({passed: true})) });
+};
+$('submit-fail').onclick = async () => {
+  const catalog = await api('/catalog').catch(() => null);
+  const total = catalog?.problems.find(p => p.id === currentProblemId)?.test_count || 1;
+  submitWork({ passed: 0, total, cases: Array.from({length: total}, () => ({passed: false})) });
+};
+
+$('history-get').onclick = () => api('/ranked/history').then(data => $('history-out').textContent = JSON.stringify(data, null, 2)).catch(() => {});
+</script>
+</body>
+</html>

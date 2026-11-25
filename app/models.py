@@ -149,7 +149,53 @@ class ReactionBroadcast(StrictModel):
     payload: ReactionPayload
 
 
+class MatchFoundProblem(StrictModel):
+    id: str
+    title: str
+
+
+class MatchFoundPayload(StrictModel):
+    match_id: str
+    opponent: str
+    opponent_rating: int
+    deadline: float
+    problems: list[MatchFoundProblem]
+
+
+class MatchFoundEvent(StrictModel):
+    type: Literal["match_found"] = "match_found"
+    payload: MatchFoundPayload
+
+
+class OpponentProgressPayload(StrictModel):
+    problem_statuses: dict[str, Literal["not_started", "attempted", "passed"]]
+    correctness: float
+
+
+class OpponentProgressEvent(StrictModel):
+    type: Literal["opponent_progress"] = "opponent_progress"
+    payload: OpponentProgressPayload
+
+
+class MatchResultPayload(StrictModel):
+    # "abandoned" marks a loss specifically caused by never submitting
+    # anything, distinct from a "loss" earned by trying and losing on
+    # correctness/time — see the Obsidian plan's abandonment-as-loss rule.
+    outcome: Literal["win", "loss", "draw", "abandoned"]
+    my_correctness: float
+    opponent_correctness: float
+    rating_before: int
+    rating_after: int
+    opponent_rating_after: int
+
+
+class MatchResultEvent(StrictModel):
+    type: Literal["match_result"] = "match_result"
+    payload: MatchResultPayload
+
+
 ServerEvent = (
     RoomStateEvent | ChatBroadcast | SystemEvent | ErrorEvent
     | TypingBroadcast | ReactionBroadcast
+    | MatchFoundEvent | OpponentProgressEvent | MatchResultEvent
 )
