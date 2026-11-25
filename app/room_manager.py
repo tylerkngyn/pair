@@ -26,6 +26,7 @@ class Peer:
     room: str | None = None
     user_id: str | None = None
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    disconnected: bool = False
 
 
 @dataclass
@@ -158,6 +159,13 @@ class RoomManager:
             )))
 
     async def disconnect(self, peer: Peer) -> None:
+        """Idempotent per peer: see RedisRoomManager.disconnect's docstring
+        for the double-call path this guards against, for this manager's
+        own protection against ever being called twice for one peer.
+        """
+        if peer.disconnected:
+            return
+        peer.disconnected = True
         METRICS.ws_connections_active.dec()
         log_event("ws_disconnect", peer_id=id(peer), room=peer.room)
         if peer.user_id is not None and self._users.get(peer.user_id) is peer:

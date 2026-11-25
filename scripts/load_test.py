@@ -83,11 +83,15 @@ def host_load_check(max_load_per_core: float = 1.5, min_free_swap_mb: int = 300)
         ncpu = int(subprocess.run(["sysctl", "-n", "hw.ncpu"], capture_output=True, text=True, timeout=5).stdout.strip())
         per_core = load1 / ncpu
         swap_out = subprocess.run(["sysctl", "vm.swapusage"], capture_output=True, text=True, timeout=5).stdout
+        total_mb = float(re.search(r"total\s*=\s*([\d.]+)M", swap_out).group(1))
         free_mb = float(re.search(r"free\s*=\s*([\d.]+)M", swap_out).group(1))
-        reason = f"load1={load1} ncpu={ncpu} load_per_core={per_core:.2f} free_swap_mb={free_mb:.0f}"
+        reason = f"load1={load1} ncpu={ncpu} load_per_core={per_core:.2f} free_swap_mb={free_mb:.0f} total_swap_mb={total_mb:.0f}"
         if per_core > max_load_per_core:
             return False, f"load too high to proceed fairly: {reason}"
-        if free_mb < min_free_swap_mb:
+        # macOS allocates swap lazily: total=0 just means no swapfile exists
+        # yet (the common idle-Mac state), not that swap is exhausted. Only
+        # treat free space as a signal once a swapfile actually exists.
+        if total_mb > 0 and free_mb < min_free_swap_mb:
             return False, f"too little free swap to proceed safely: {reason}"
         return True, reason
     except Exception as exc:
@@ -164,10 +168,23 @@ class Cluster:
 
 
 async def run_pair(room_code: str, port_a: int, port_b: int, messages: int,
-                    connect_latencies: list, msg_latencies: list, failures: list, timeouts: list) -> None:
+                    connect_latencies: list, msg_latencies: list, failures: list,
+                    never_paired_timeouts: list, message_phase_timeouts: list, completed: list) -> None:
+    """Classifies each room into exactly one outcome bucket: completed,
+    message_phase_timeouts, never_paired_timeouts, or failures.
+    `connect_latencies` records pairing latency for every room that paired,
+    even one that later times out mid-message — it is NOT itself an outcome
+    bucket and must never be read as "successful pairs" (that overlapped
+    with timed_out_pairs before this fix: a room could pair, get counted
+    here, then time out waiting for a chat message and get counted in
+    timeouts too). `completed` is appended only once a room has paired AND
+    exchanged every message with no error, so it is disjoint from the two
+    timeout buckets and from failures by construction.
+    """
     url_a = f"ws://127.0.0.1:{port_a}/ws"
     url_b = f"ws://127.0.0.1:{port_b}/ws"
     t0 = time.monotonic()
+    paired = False
     try:
         async with websockets.connect(url_a, close_timeout=1) as ws_a, \
                    websockets.connect(url_b, close_timeout=1) as ws_b:
@@ -187,6 +204,7 @@ async def run_pair(room_code: str, port_a: int, port_b: int, messages: int,
 
             await drain_until(ws_a, "room_state", lambda p: p["status"] == "paired")
             await drain_until(ws_b, "room_state", lambda p: p["status"] == "paired")
+            paired = True
             connect_latencies.append(time.monotonic() - t0)
 
             for i in range(messages):
@@ -195,8 +213,9 @@ async def run_pair(room_code: str, port_a: int, port_b: int, messages: int,
                 await ws_a.send(json.dumps({"type": "chat", "payload": {"text": text}}))
                 await drain_until(ws_b, "chat", lambda p, text=text: p["text"] == text, timeout=10)
                 msg_latencies.append(time.monotonic() - send_ts)
+            completed.append(room_code)
     except TimeoutError as exc:
-        timeouts.append(f"{type(exc).__name__}: {exc}")
+        (message_phase_timeouts if paired else never_paired_timeouts).append(f"{type(exc).__name__}: {exc}")
     except Exception as exc:
         failures.append(f"{type(exc).__name__}: {exc}")
 
@@ -212,7 +231,8 @@ async def main_async(num_workers: int, num_clients: int, messages: int, concurre
     cluster.start()
     try:
         num_rooms = num_clients // 2
-        connect_latencies, msg_latencies, failures, timeouts = [], [], [], []
+        connect_latencies, msg_latencies, failures = [], [], []
+        never_paired_timeouts, message_phase_timeouts, completed = [], [], []
         sem = asyncio.Semaphore(concurrency_ramp)
 
         async def bounded_run(i):
@@ -225,7 +245,11 @@ async def main_async(num_workers: int, num_clients: int, messages: int, concurre
             async with sem:
                 port_a = cluster.ports[i % len(cluster.ports)]
                 port_b = cluster.ports[(i + 1) % len(cluster.ports)]
-                await run_pair(f"R{i:05d}", port_a, port_b, messages, connect_latencies, msg_latencies, failures, timeouts)
+                await run_pair(
+                    f"R{i:05d}", port_a, port_b, messages,
+                    connect_latencies, msg_latencies, failures,
+                    never_paired_timeouts, message_phase_timeouts, completed,
+                )
 
         start = time.monotonic()
         tasks = [asyncio.create_task(bounded_run(i)) for i in range(num_rooms)]
@@ -248,18 +272,29 @@ async def main_async(num_workers: int, num_clients: int, messages: int, concurre
             "rooms": num_rooms,
             "messages_per_pair": messages,
             "elapsed_seconds": round(elapsed, 2),
-            "successful_pairs": len(connect_latencies),
-            "timed_out_pairs": len(timeouts),
+            # Mutually exclusive outcome buckets; together they sum to num_rooms.
+            "completed_pairs": len(completed),
+            "paired_but_message_timeout": len(message_phase_timeouts),
+            "never_paired_timeout": len(never_paired_timeouts),
             "other_failed_pairs": len(failures),
+            # Pairing latency for every room that paired, whether or not it
+            # went on to complete all messages — not an outcome count.
+            "rooms_that_paired": len(connect_latencies),
             "connect_success_rate": round(len(connect_latencies) / num_rooms, 4) if num_rooms else None,
             "total_messages_delivered": total_messages,
             "throughput_msgs_per_sec": round(total_messages / elapsed, 1) if elapsed > 0 else 0,
             "message_latency_ms": {"p50": pct(sorted_msg, 0.50), "p95": pct(sorted_msg, 0.95), "p99": pct(sorted_msg, 0.99)},
             "health_responsive_after_run": health_after,
-            "sample_timeouts": timeouts[:3],
+            "sample_never_paired_timeouts": never_paired_timeouts[:3],
+            "sample_message_phase_timeouts": message_phase_timeouts[:3],
             "sample_other_failures": failures[:3],
             "server_metrics": cluster.summed_metrics(),
         }
+        outcome_total = len(completed) + len(message_phase_timeouts) + len(never_paired_timeouts) + len(failures)
+        assert outcome_total == num_rooms, (
+            f"outcome buckets ({outcome_total}) don't sum to num_rooms ({num_rooms}); "
+            "a room was counted in zero or more than one bucket"
+        )
         print(json.dumps(result, indent=2))
         return result
     finally:

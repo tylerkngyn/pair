@@ -79,6 +79,7 @@ class Peer:
     room: str | None = None
     user_id: str | None = None
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    disconnected: bool = False
 
 
 class RedisRoomManager:
@@ -272,7 +273,17 @@ class RedisRoomManager:
         lifecycle already (it's closing or already closed), so this only
         drops bookkeeping and Redis membership — it never re-closes the
         socket itself, unlike _remove_peer used by reap/eviction below.
+
+        Idempotent per peer: a fan-out failure (_handle_message, below) can
+        run this for a peer whose own websocket_endpoint loop independently
+        reaches the same cleanup once that path's close() ends its receive()
+        loop. The Redis-side removal is already idempotent via HDEL's return
+        value; this guard makes the metric decrement match, or one real
+        disconnect double-counts.
         """
+        if peer.disconnected:
+            return
+        peer.disconnected = True
         METRICS.ws_connections_active.dec()
         log_event("ws_disconnect", peer_id=peer.id, room=peer.room)
         if peer.user_id is not None and self._local_users.get(peer.user_id) is peer:

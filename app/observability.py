@@ -14,9 +14,16 @@ Observability section for why cluster-wide aggregation isn't built here.
 
 import json
 import logging
+import os
 import time
 
 logger = logging.getLogger("pair.events")
+
+# Escape hatch for the Step 5 observability-cost comparison in
+# TylerJunze MILLION DOLLAR Plan.md: with this set, log_event() and every
+# metric update below become no-ops, so a latency run can isolate the cost
+# of instrumentation itself. Unset (the default) in every real deployment.
+DISABLED = os.environ.get("PAIR_DISABLE_OBSERVABILITY") == "1"
 
 
 def log_event(event: str, **fields) -> None:
@@ -24,6 +31,8 @@ def log_event(event: str, **fields) -> None:
     include whatever ID makes the event traceable - peer_id, user_id,
     match_id, room, etc. - per the call site's own docstring/comment.
     """
+    if DISABLED:
+        return
     logger.info(json.dumps({"event": event, "ts": round(time.time(), 6), **fields}))
 
 
@@ -34,6 +43,8 @@ class _Counter:
         self.value = 0.0
 
     def inc(self, amount: float = 1.0) -> None:
+        if DISABLED:
+            return
         self.value += amount
 
     def render(self) -> str:
@@ -47,12 +58,18 @@ class _Gauge:
         self.value = 0.0
 
     def set(self, value: float) -> None:
+        if DISABLED:
+            return
         self.value = value
 
     def inc(self, amount: float = 1.0) -> None:
+        if DISABLED:
+            return
         self.value += amount
 
     def dec(self, amount: float = 1.0) -> None:
+        if DISABLED:
+            return
         self.value -= amount
 
     def render(self) -> str:
@@ -74,6 +91,8 @@ class _Histogram:
         self.count = 0
 
     def observe(self, value: float) -> None:
+        if DISABLED:
+            return
         self.sum += value
         self.count += 1
         for i, upper_bound in enumerate(self.buckets):

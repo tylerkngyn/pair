@@ -12,7 +12,18 @@ from redis.exceptions import RedisError
 
 import app.redis_room_manager as redis_room_manager
 from app.models import SystemEvent, SystemPayload
+from app.observability import METRICS
 from app.redis_room_manager import Peer, RedisRoomManager
+
+
+@pytest.fixture(autouse=True)
+def reset_ws_gauge():
+    # METRICS is a module-level singleton; several tests here construct a
+    # Peer directly and call disconnect() without ever calling connect(),
+    # which would otherwise leave the gauge permanently offset for every
+    # later test in the process, including any asserting its exact value.
+    METRICS.ws_connections_active.value = 0
+    yield
 
 
 @pytest.fixture(autouse=True)
@@ -134,6 +145,117 @@ def test_cross_worker_disconnect_notifies_other_worker(two_workers):
             e["type"] == "room_state" and e["payload"]["status"] == "waiting" and e["payload"]["peers"] == ["Bob"]
             for e in bob.socket.events
         )
+
+    run_with_workers(worker_a, worker_b, scenario)
+
+
+def test_disconnect_after_fanout_failure_does_not_double_decrement(two_workers):
+    """A peer whose local send fails during fan-out gets cleaned up and closed
+    by _handle_message (redis_room_manager.py:431-433), exactly like a real
+    broken socket. The same peer's own websocket_endpoint loop in app/main.py
+    then also hits its `finally: await manager.disconnect(peer)` once that
+    close() causes its receive() to end — the same peer's disconnect() runs
+    twice for one real connection going away.
+
+    disconnect()'s Redis-side cleanup (_remove_from_redis) is already
+    idempotent via HDEL's return value, but the ws_connections_active
+    decrement at the top of disconnect() is unconditional, so it double-counts.
+    """
+    worker_a, worker_b = two_workers
+
+    async def scenario():
+        alice = Peer(socket=FakeSocket())
+        bob = Peer(socket=FakeSocket())
+        await worker_a.join(alice, "ABC123", "Alice")
+        await worker_a.join(bob, "ABC123", "Bob")
+        await settle()
+
+        before = METRICS.ws_connections_active.value
+
+        # Simulate bob's socket being broken: any send to it now fails.
+        async def broken_send_json(event):
+            raise OSError("broken pipe")
+        bob.socket.send_json = broken_send_json
+
+        # Alice's chat triggers fan-out to both local peers on worker_a;
+        # bob's send fails, so _handle_message's failure path runs
+        # self.disconnect(bob) + self.close(bob, 1011) (lines 431-433).
+        await worker_a.chat(alice, "hi")
+        await settle()
+
+        # bob's own websocket_endpoint loop (app/main.py) independently
+        # notices the connection ended and runs its own cleanup, exactly
+        # like the `finally: await manager.disconnect(peer)` there.
+        await worker_a.disconnect(bob)
+
+        after = METRICS.ws_connections_active.value
+        assert before - after == 1, (
+            f"one real disconnect decremented the gauge by {before - after}; "
+            "disconnect() must be idempotent per peer"
+        )
+
+    run_with_workers(worker_a, worker_b, scenario)
+
+
+def test_many_concurrent_connects_and_disconnects_gauge_stays_sane(two_workers):
+    """Regression guard for the double-decrement bug above, at volume: many
+    peers connect, some have broken sockets (abrupt client drops), fan-out
+    failures and each peer's own repeated disconnect() calls all race
+    concurrently. The gauge must never go negative mid-run and must land
+    on exactly 0 once everything settles, regardless of call order.
+    """
+    worker_a, worker_b = two_workers
+
+    async def scenario():
+        peers = [await worker_a.connect(FakeSocket()) for _ in range(20)]
+
+        gauge = METRICS.ws_connections_active
+        min_seen = gauge.value
+        original_dec = gauge.dec
+
+        def tracking_dec(amount=1.0):
+            nonlocal min_seen
+            original_dec(amount)
+            min_seen = min(min_seen, gauge.value)
+
+        gauge.dec = tracking_dec
+        try:
+            for i in range(0, len(peers), 2):
+                await worker_a.join(peers[i], f"R{i}", f"A{i}")
+                await worker_a.join(peers[i + 1], f"R{i}", f"B{i}")
+            await settle()
+
+            # Abrupt drops: half the sockets now fail every send, as a real
+            # dropped connection's write would.
+            async def broken_send_json(event):
+                raise OSError("broken pipe")
+            for peer in peers[::2]:
+                peer.socket.send_json = broken_send_json
+
+            # Each peer's partner chats (triggering the fan-out-failure
+            # disconnect path for broken peers) while that same peer's own
+            # cleanup runs several times concurrently — the same race as a
+            # client abruptly dropping while a fan-out is in flight.
+            async def drop_pair(a, b):
+                await asyncio.gather(
+                    worker_a.chat(a, "ping"),
+                    worker_a.chat(b, "pong"),
+                    *(worker_a.disconnect(a) for _ in range(3)),
+                    *(worker_a.disconnect(b) for _ in range(3)),
+                )
+                # Late redundant calls, as if both the fan-out cleanup and
+                # app/main.py's own `finally` fired one more time each.
+                await asyncio.gather(worker_a.disconnect(a), worker_a.disconnect(b))
+
+            await asyncio.gather(*(
+                drop_pair(peers[i], peers[i + 1]) for i in range(0, len(peers), 2)
+            ))
+            await settle()
+        finally:
+            gauge.dec = original_dec
+
+        assert min_seen >= 0, f"gauge went negative mid-run: {min_seen}"
+        assert gauge.value == 0, f"gauge did not return to exactly 0: {gauge.value}"
 
     run_with_workers(worker_a, worker_b, scenario)
 
