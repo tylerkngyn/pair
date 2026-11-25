@@ -11,6 +11,7 @@ workers cannot both succeed for the same slot.
 
 import asyncio
 import json
+import logging
 import os
 import secrets
 import time
@@ -18,6 +19,15 @@ from dataclasses import dataclass, field
 
 from fastapi import WebSocket, WebSocketDisconnect
 from redis.asyncio import Redis
+from redis.exceptions import RedisError
+
+logger = logging.getLogger(__name__)
+
+# Backoff before retrying the pub/sub listener or a reap sweep after a Redis
+# connection error, so a dropped connection is logged and retried rather than
+# silently killing the background task forever (the single biggest risk of
+# Redis being this deployment's one shared dependency — see README).
+RECONNECT_BACKOFF_SECONDS = 2
 
 CHANNEL_PREFIX = "chan:"
 USER_CHANNEL_PREFIX = "user:"
@@ -329,7 +339,10 @@ class RedisRoomManager:
     async def _reap_loop(self) -> None:
         while True:
             await asyncio.sleep(REAP_INTERVAL_SECONDS)
-            await self._reap_once()
+            try:
+                await self._reap_once()
+            except RedisError:
+                logger.warning("Reap sweep failed; Redis unreachable, will retry next interval", exc_info=True)
 
     async def _reap_once(self) -> None:
         """Remove peers whose presence key lapsed, e.g. from a crashed worker.
@@ -355,33 +368,50 @@ class RedisRoomManager:
                     await self._remove_peer(code, peer_id, handle)
 
     async def _listen(self) -> None:
-        async with self._redis.pubsub() as pubsub:
-            await pubsub.psubscribe(f"{CHANNEL_PREFIX}*")
-            await pubsub.psubscribe(f"{USER_CHANNEL_PREFIX}*")
-            async for message in pubsub.listen():
-                if message["type"] != "pmessage":
-                    continue
-                channel = message["channel"]
-                try:
-                    event = json.loads(message["data"])
-                except ValueError:
-                    continue
-                if channel.startswith(USER_CHANNEL_PREFIX):
-                    peer = self._local_users.get(channel.removeprefix(USER_CHANNEL_PREFIX))
-                    if peer is not None and await self._send_raw(peer, event["event"]):
-                        await self._redis.set(f"{ACK_KEY_PREFIX}{event['nonce']}", 1, ex=ACK_TTL_SECONDS)
-                    continue
-                code = channel.removeprefix(CHANNEL_PREFIX)
-                if event.get("type") == "_evict":
-                    await self._handle_evict(code, event["payload"]["peer_id"])
-                    continue
-                peers = self._local_peers.get(code)
-                if not peers:
-                    continue
-                failed = []
-                for p in list(peers):
-                    if not await self._send_raw(p, event):
-                        failed.append(p)
-                for p in failed:
-                    await self.disconnect(p)
-                    await self.close(p, 1011)
+        """Runs for the manager's lifetime. A dropped Redis connection would
+        otherwise raise out of `pubsub.listen()` and silently kill this
+        background task forever — every local peer would stop receiving any
+        room/user events with no signal anywhere. Log it and resubscribe
+        instead.
+        """
+        while True:
+            try:
+                async with self._redis.pubsub() as pubsub:
+                    await pubsub.psubscribe(f"{CHANNEL_PREFIX}*")
+                    await pubsub.psubscribe(f"{USER_CHANNEL_PREFIX}*")
+                    async for message in pubsub.listen():
+                        await self._handle_message(message)
+            except RedisError:
+                logger.warning(
+                    "Pub/sub listener lost its Redis connection; reconnecting in %ss",
+                    RECONNECT_BACKOFF_SECONDS, exc_info=True,
+                )
+                await asyncio.sleep(RECONNECT_BACKOFF_SECONDS)
+
+    async def _handle_message(self, message: dict) -> None:
+        if message["type"] != "pmessage":
+            return
+        channel = message["channel"]
+        try:
+            event = json.loads(message["data"])
+        except ValueError:
+            return
+        if channel.startswith(USER_CHANNEL_PREFIX):
+            peer = self._local_users.get(channel.removeprefix(USER_CHANNEL_PREFIX))
+            if peer is not None and await self._send_raw(peer, event["event"]):
+                await self._redis.set(f"{ACK_KEY_PREFIX}{event['nonce']}", 1, ex=ACK_TTL_SECONDS)
+            return
+        code = channel.removeprefix(CHANNEL_PREFIX)
+        if event.get("type") == "_evict":
+            await self._handle_evict(code, event["payload"]["peer_id"])
+            return
+        peers = self._local_peers.get(code)
+        if not peers:
+            return
+        failed = []
+        for p in list(peers):
+            if not await self._send_raw(p, event):
+                failed.append(p)
+        for p in failed:
+            await self.disconnect(p)
+            await self.close(p, 1011)

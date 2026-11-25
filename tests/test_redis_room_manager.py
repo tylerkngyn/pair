@@ -8,6 +8,7 @@ import asyncio
 import pytest
 from fakeredis import FakeServer
 from fakeredis.aioredis import FakeRedis
+from redis.exceptions import RedisError
 
 import app.redis_room_manager as redis_room_manager
 from app.models import SystemEvent, SystemPayload
@@ -417,5 +418,86 @@ def test_disconnect_clears_user_identity(two_workers):
 
         assert delivered is False
         assert alice.socket.events == []
+
+    run_with_workers(worker_a, worker_b, scenario)
+
+
+class _DroppedConnection:
+    """An async context manager standing in for self._redis.pubsub() that
+    simulates a Redis connection failing right as the listener tries to
+    (re)subscribe - the exact moment _listen's own psubscribe call would
+    raise RedisError on a real dropped connection.
+    """
+
+    async def __aenter__(self):
+        raise RedisError("simulated Redis connection drop")
+
+    async def __aexit__(self, *exc_info):
+        pass
+
+
+def test_listener_survives_a_dropped_connection_and_resumes(two_workers, monkeypatch):
+    """Regression test for the listener task silently dying on any Redis
+    hiccup. Before the RECONNECT_BACKOFF_SECONDS/RedisError retry existed,
+    this exact scenario (pubsub() raising once, then working again) left
+    worker_a's listener task dead forever - alice, held locally on
+    worker_a, would never receive anything again, with nothing anywhere
+    signaling it. Confirmed to fail without the fix: see the commit that
+    added the try/except for the before/after run.
+    """
+    worker_a, worker_b = two_workers
+    monkeypatch.setattr(redis_room_manager, "RECONNECT_BACKOFF_SECONDS", 0.05)
+
+    real_pubsub = worker_a._redis.pubsub
+    calls = {"count": 0}
+
+    def flaky_pubsub(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return _DroppedConnection()
+        return real_pubsub(*args, **kwargs)
+
+    monkeypatch.setattr(worker_a._redis, "pubsub", flaky_pubsub)
+
+    async def scenario():
+        alice = Peer(socket=FakeSocket())
+        await worker_a.identify(alice, "user-alice")
+        # Long enough for the first (failing) subscribe attempt, the
+        # RECONNECT_BACKOFF_SECONDS sleep, and the second (successful) one.
+        await asyncio.sleep(0.3)
+
+        delivered = await worker_b.send_to_user("user-alice", SystemEvent(payload=SystemPayload(text="hello")))
+        assert delivered is True
+        assert calls["count"] >= 2
+        assert any(e["type"] == "system" and e["payload"]["text"] == "hello" for e in alice.socket.events)
+
+    run_with_workers(worker_a, worker_b, scenario)
+
+
+def test_reap_loop_survives_a_redis_error_and_keeps_reaping(two_workers, monkeypatch):
+    """Regression test for the reap loop dying the same way the listener
+    could: one _reap_once() call raising RedisError must not stop the
+    REAP_INTERVAL_SECONDS loop from trying again next tick.
+    """
+    worker_a, worker_b = two_workers
+    monkeypatch.setattr(redis_room_manager, "REAP_INTERVAL_SECONDS", 0.05)
+
+    real_reap_once = worker_a._reap_once
+    calls = {"count": 0}
+
+    async def flaky_reap_once():
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RedisError("simulated Redis error during a reap sweep")
+        await real_reap_once()
+
+    monkeypatch.setattr(worker_a, "_reap_once", flaky_reap_once)
+
+    async def scenario():
+        # Two sweeps' worth of waiting: the first raises and is caught: the
+        # loop must still be alive to run a second one.
+        await asyncio.sleep(0.2)
+        assert calls["count"] >= 2
+        assert not worker_a._reap_task.done()
 
     run_with_workers(worker_a, worker_b, scenario)
