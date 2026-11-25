@@ -143,6 +143,7 @@ python scripts/kill_test.py --reps 3
 - `message_fanout` — `room`, `event_type`, `recipients` (once per fan-out call, not per recipient)
 - `ranked_queue_join` — `user_id`, `backend`, `status`, `match_id` when matched, `via="poll"` when found by a widen-on-poll
 - `ranked_finalize` — `match_id`, plus `lock=`/`db_guard=`/`result=`
+- `redis_reconnect` — `source="listener"` or `source="reap_loop"`
 
 ## Known limitations and what's next
 
